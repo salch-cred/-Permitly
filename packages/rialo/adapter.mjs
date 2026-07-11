@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { sha256 } from '../core/receipts.mjs';
 
 // Lazily import the official Rialo TS CDK (only used in rpc mode)
@@ -16,6 +17,7 @@ export class RialoAdapter {
     this.chainId = config.chainId || process.env.RIALO_CHAIN_ID || 'rialo:devnet';
     this.programId = config.programId || process.env.RIALO_PROGRAM_ID || 'local-agentpermit';
     this.dataDir = config.dataDir || process.env.DATA_DIR || './data';
+    this.relayerKey = config.relayerKey || process.env.RIALO_RELAYER_KEY || null;
     this._client = null;
   }
 
@@ -31,7 +33,6 @@ export class RialoAdapter {
 
   /**
    * Record a governance event on the Rialo ledger.
-   * Supports all v4 contract methods: agent ops, policy ops, permits, approvals, staking, delegation, timelock.
    */
   async record(kind, payload) {
     const envelope = {
@@ -40,7 +41,7 @@ export class RialoAdapter {
       kind,
       payload,
       nonce: Date.now(),
-      version: 4  // v4 contract
+      version: 4
     };
 
     if (this.mode === 'rpc') {
@@ -77,18 +78,13 @@ export class RialoAdapter {
     return tx;
   }
 
-  /**
-   * Read governance records by key (agent ID, permit ID, approval ID, etc.)
-   */
   async read(key) {
     if (this.mode === 'rpc') {
       try {
         const client = await this.#getClient();
         const result = await client.getWorkflowLineage({ programId: this.programId, key });
         return result || [];
-      } catch {
-        // Fall back to local ledger
-      }
+      } catch {}
     }
     const file = path.join(this.dataDir, 'ledger.json');
     try {
@@ -103,9 +99,6 @@ export class RialoAdapter {
     } catch { return []; }
   }
 
-  /**
-   * Read all records of a specific kind (e.g. all permits, all stakes)
-   */
   async readByKind(kind) {
     const file = path.join(this.dataDir, 'ledger.json');
     try {
@@ -114,9 +107,6 @@ export class RialoAdapter {
     } catch { return []; }
   }
 
-  /**
-   * Health check — returns connection status and chain info
-   */
   async health() {
     if (this.mode === 'rpc') {
       try {
@@ -129,7 +119,8 @@ export class RialoAdapter {
           rpcUrl: this.rpcUrl,
           connected: health === 'ok',
           blockHeight,
-          contractVersion: 4
+          contractVersion: 4,
+          cruiseEnabled: !!this.relayerKey
         };
       } catch (error) {
         return {
@@ -138,7 +129,8 @@ export class RialoAdapter {
           rpcUrl: this.rpcUrl,
           connected: false,
           error: error.message,
-          contractVersion: 4
+          contractVersion: 4,
+          cruiseEnabled: false
         };
       }
     }
@@ -147,13 +139,11 @@ export class RialoAdapter {
       chainId: this.chainId,
       programId: this.programId,
       connected: true,
-      contractVersion: 4
+      contractVersion: 4,
+      cruiseEnabled: true
     };
   }
 
-  /**
-   * Get live devnet balance for a public key
-   */
   async getBalance(publicKey) {
     try {
       const client = await this.#getClient();
@@ -164,51 +154,179 @@ export class RialoAdapter {
   }
 
   // ============================================================
+  // Rialo Cruise: Gas-less Meta-Transaction Support
+  // ============================================================
+
+  /**
+   * Create a meta-transaction payload that an agent/user signs off-chain.
+   * The relayer (Permitly backend) submits it, paying the gas.
+   *
+   * @param {string} kind - Contract method name (e.g. 'sponsored_issue_permit')
+   * @param {object} params - Parameters for the contract method
+   * @param {string} signerAddress - Address of the user signing (agent controller)
+   * @param {number} nonce - Current nonce for this signer (prevents replay)
+   * @param {number} gasAmount - Estimated gas cost in kelvins
+   * @returns {object} metaTxPayload - The payload to be signed
+   */
+  createMetaTxPayload(kind, params, signerAddress, nonce, gasAmount = 1000) {
+    const payload = {
+      kind,
+      params,
+      signer: signerAddress,
+      nonce,
+      gasAmount,
+      chainId: this.chainId,
+      programId: this.programId,
+      expiresAt: Math.floor(Date.now() / 1000) + 3600, // 1 hour expiry
+      version: 1
+    };
+    return payload;
+  }
+
+  /**
+   * Sign a meta-transaction payload with a user's keypair.
+   * The signature proves the user authorized this specific action.
+   *
+   * @param {object} payload - Meta-tx payload from createMetaTxPayload
+   * @param {object} signerKeypair - User's Keypair (from @rialo/ts-cdk)
+   * @returns {string} hex-encoded signature
+   */
+  async signMetaTxPayload(payload, signerKeypair) {
+    const payloadBytes = new TextEncoder().encode(JSON.stringify(payload, Object.keys(payload).sort()));
+    const signature = await signerKeypair.sign(payloadBytes);
+    return Buffer.from(signature).toString('hex');
+  }
+
+  /**
+   * Verify a meta-transaction signature.
+   *
+   * @param {object} payload - The original meta-tx payload
+   * @param {string} signatureHex - Hex-encoded signature
+   * @param {object} signerPublicKey - Public key of the claimed signer
+   * @returns {boolean} whether the signature is valid
+   */
+  async verifyMetaTxSignature(payload, signatureHex, signerPublicKey) {
+    const payloadBytes = new TextEncoder().encode(JSON.stringify(payload, Object.keys(payload).sort()));
+    const signature = Buffer.from(signatureHex, 'hex');
+    return signerPublicKey.verify(payloadBytes, signature);
+  }
+
+  /**
+   * Submit a meta-transaction through the relay endpoint.
+   * The relayer (Permitly backend) pays the gas fee.
+   *
+   * @param {object} payload - Meta-tx payload
+   * @param {string} signature - Hex-encoded user signature
+   * @param {string} relayEndpoint - URL of the relay API (e.g. 'http://localhost:8787/api/cruise/relay')
+   * @returns {object} relay result
+   */
+  async relayMetaTx(payload, signature, relayEndpoint) {
+    const response = await fetch(relayEndpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        payload,
+        signature,
+        relayToken: process.env.RIALO_RELAY_TOKEN || ''
+      })
+    });
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`Relay failed: ${err}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * Get the current nonce for a signer address.
+   * Used when constructing meta-tx payloads.
+   */
+  async getNonce(signerAddress) {
+    if (this.mode === 'rpc') {
+      try {
+        const client = await this.#getClient();
+        const result = await client.callWithJson('getMetaTxNonce', {
+          programId: this.programId,
+          signer: signerAddress
+        });
+        return Number(result) || 0;
+      } catch {}
+    }
+    // Mock mode: read from ledger
+    const file = path.join(this.dataDir, 'ledger.json');
+    try {
+      const ledger = JSON.parse(await fs.readFile(file, 'utf8'));
+      const metaTxs = ledger.filter(x =>
+        x.kind === 'sponsored_issue_permit' ||
+        x.kind === 'sponsored_authorize' ||
+        x.kind === 'sponsored_record_denial'
+      );
+      return metaTxs.length;
+    } catch { return 0; }
+  }
+
+  // ============================================================
   // Convenience methods for v4 contract operations
   // ============================================================
 
-  /** Record a permit issuance */
   async recordPermitIssued(permitId, agentId, policyId, roleId, expiresAt) {
     return this.record('issuePermit', { permitId, agentId, policyId, roleId, expiresAt });
   }
 
-  /** Record an action authorization */
   async recordActionAuthorized(receiptId, permitId, actionHash, amount) {
     return this.record('authorizeAndConsume', { receiptId, permitId, actionHash, amount });
   }
 
-  /** Record an approval request (multi-sig) */
   async recordApprovalRequested(approvalId, permitId, actionHash, amount, requiredVotes) {
     return this.record('requestApproval', { approvalId, permitId, actionHash, amount, requiredVotes });
   }
 
-  /** Record a guardian vote */
   async recordVoteCast(approvalId, guardian, approved) {
     return this.record('castVote', { approvalId, guardian, approved });
   }
 
-  /** Record a stake deposit */
   async recordStakeDeposited(agentId, amount) {
     return this.record('depositStake', { agentId, amount });
   }
 
-  /** Record a stake slash */
   async recordStakeSlashed(agentId, amount, reason, receiptId) {
     return this.record('slashStake', { agentId, amount, reason, receiptId });
   }
 
-  /** Record a delegation */
   async recordDelegationCreated(delegationId, agentId, delegate, scopeRoot, expiresAt) {
     return this.record('createDelegation', { delegationId, agentId, delegate, scopeRoot, expiresAt });
   }
 
-  /** Record a timelock action */
   async recordTimelockScheduled(actionId, targetFn, executesAt) {
     return this.record('scheduleTimelockAction', { actionId, targetFn, executesAt });
   }
 
-  /** Record a policy migration */
   async recordPolicyMigration(migrationId, policyId, fromVersion, toVersion) {
     return this.record('startPolicyMigration', { migrationId, policyId, fromVersion, toVersion });
+  }
+
+  // ============================================================
+  // Rialo Cruise convenience methods
+  // ============================================================
+
+  /** Record a sponsored (gas-less) permit issuance */
+  async recordSponsoredPermitIssued(permitId, agentId, policyId, roleId, expiresAt, signer, nonce, gasAmount) {
+    return this.record('sponsored_issue_permit', {
+      permitId, agentId, policyId, roleId, expiresAt, signer, nonce, gasAmount
+    });
+  }
+
+  /** Record a sponsored (gas-less) authorization */
+  async recordSponsoredAuthorization(receiptId, permitId, actionHash, amount, signer, nonce, gasAmount) {
+    return this.record('sponsored_authorize', {
+      receiptId, permitId, actionHash, amount, signer, nonce, gasAmount
+    });
+  }
+
+  /** Record a sponsored (gas-less) denial */
+  async recordSponsoredDenial(permitId, actionHash, receiptId, previousHash, result, signer, nonce, gasAmount) {
+    return this.record('sponsored_record_denial', {
+      permitId, actionHash, receiptId, previousHash, result, signer, nonce, gasAmount
+    });
   }
 }
