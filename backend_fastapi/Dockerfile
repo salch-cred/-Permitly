@@ -5,13 +5,13 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-COPY backend_fastapi/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY backend_fastapi/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY backend_fastapi /app
+# Copy entire repo (needed for apps/web static files)
+COPY . .
 
-ENV HOST=0.0.0.0
-# Hugging Face sets PORT; default for local runs
-ENV PORT=7860
+ENV PYTHONPATH=/app/backend_fastapi:$PYTHONPATH
+ENV HOST=0.0.0.0 PORT=7860
 
-CMD ["sh","-lc","uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-7860}"]
+CMD ["sh","-c","cd backend_fastapi && uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-7860}"]

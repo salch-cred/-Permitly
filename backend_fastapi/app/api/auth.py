@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -8,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import RegisterRequest, RegisterResponse, LoginRequest, LoginResponse, ApiKeyCreateRequest, ApiKeyCreateResponse
 from app.core.config import get_settings
-from app.core.security import password_hash, password_verify, create_api_key, sign_session
+from app.core.security import password_hash, password_verify, create_api_key, sign_session, random_token
 from app.core.rbac import require_permission
 from app.db import crud
 from app.api.deps import get_db, get_auth_context, AuthContext
@@ -44,6 +45,9 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     )
 
     token = make_session(str(user.id), str(ws.id))
+    await crud.append_audit(db, workspace_id=ws.id, actor_id=str(user.id),
+                             action="tenant.created", resource_type="workspace",
+                             resource_id=str(ws.id))
     return RegisterResponse(organizationId=str(org.id), workspaceId=str(ws.id), userId=str(user.id), token=token)
 
 
@@ -65,13 +69,41 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     return LoginResponse(token=token, user={"id": str(user.id), "email": user.email, "name": user.name}, workspace=selected)
 
 
+@router.post("/auth/reset-request")
+async def reset_request(body: dict, db: AsyncSession = Depends(get_db)):
+    email = body.get("email", "")
+    user = await crud.find_user_by_email(db, email)
+    if not user:
+        return {"message": "If that email exists, a reset link was sent."}
+    token = random_token("reset", 32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    await crud.create_reset_token(db, user_id=user.id, token_hash=token_hash, expires_at=expires_at)
+    return {"message": "Reset token generated.", "token": token, "expiresAt": expires_at.isoformat()}
+
+
+@router.post("/auth/reset-confirm")
+async def reset_confirm(body: dict, db: AsyncSession = Depends(get_db)):
+    token = body.get("token")
+    password = body.get("password")
+    if not token or not password:
+        raise HTTPException(status_code=400, detail="token_and_password_required")
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    try:
+        new_hash = password_hash(password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    ok = await crud.consume_reset_token(db, token_hash, new_hash)
+    if not ok:
+        raise HTTPException(status_code=400, detail="invalid_or_expired_token")
+    return {"message": "Password updated successfully."}
+
+
 @router.get("/me")
 async def me(ctx: AuthContext = Depends(get_auth_context), db: AsyncSession = Depends(get_db)):
-    # API key contexts don't have a user row.
     user = None
     workspaces = []
-    if not ctx.user_id.startswith("api-key:"):
-        # Query user directly
+    if not ctx.user_id.startswith("api-key:") and ctx.user_id != "admin":
         from sqlalchemy import select
         from app.db.models import User
 
@@ -109,4 +141,8 @@ async def create_key(req: ApiKeyCreateRequest, ctx: AuthContext = Depends(get_au
         role=req.role,
         expires_at=expires_at,
     )
+    await crud.append_audit(db, workspace_id=uuid.UUID(ctx.workspace_id), actor_id=ctx.user_id,
+                             action="api_key.created", resource_type="api_key",
+                             resource_id=str(key.id),
+                             metadata={"prefix": key.key_prefix, "role": key.role})
     return {"key": {"id": str(key.id), "workspace_id": str(key.workspace_id), "name": key.name, "key_prefix": key.key_prefix, "role": key.role, "expires_at": key.expires_at, "created_at": key.created_at, "secret": generated["raw"]}}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 from typing import Annotated
 
@@ -10,9 +11,11 @@ from app.core.config import get_settings
 from app.core.security import sha256_hex, verify_session
 from app.db.session import make_engine, make_session_factory
 from app.db import crud
+from app.core.rialo import RialoAdapter
 
 _engine = None
 _SessionLocal = None
+_rialo: RialoAdapter | None = None
 
 
 def _get_session_factory():
@@ -30,6 +33,13 @@ async def get_db() -> AsyncSession:
         yield session
 
 
+def get_rialo() -> RialoAdapter:
+    global _rialo
+    if _rialo is None:
+        _rialo = RialoAdapter()
+    return _rialo
+
+
 class AuthContext:
     def __init__(self, *, user_id: str, workspace_id: str, role: str, api_key_id: str | None = None):
         self.user_id = user_id
@@ -45,6 +55,11 @@ async def get_auth_context(
     if not authorization:
         raise HTTPException(status_code=401, detail="authentication_required")
     token = authorization.replace("Bearer ", "")
+
+    # Check admin token first
+    admin_token = os.environ.get("AGENTPERMIT_ADMIN_TOKEN", "")
+    if admin_token and token == admin_token:
+        return AuthContext(user_id="admin", workspace_id="*", role="owner")
 
     if token.startswith("ap_"):
         key = await crud.auth_api_key(db, sha256_hex(token))
