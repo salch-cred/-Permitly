@@ -1,0 +1,143 @@
+// AgentPermit governance program for Rialo.
+// Compile with the current Rialo CDK release. The async timer pattern follows Rialo's public workflow examples.
+workflow {
+  state {
+    owner: Address,
+    globally_paused: bool,
+    agents: Map<Bytes32, Agent>,
+    policies: Map<Bytes32, Policy>,
+    permits: Map<Bytes32, Permit>,
+    approvals: Map<Bytes32, Approval>,
+    receipts: Map<Bytes32, Receipt>,
+    credential_hashes: Map<Bytes32, Bytes32>
+  }
+
+  struct Agent { controller: Address, active: bool }
+  struct Policy { policy_hash: Bytes32, version: u32, active: bool }
+  struct Permit {
+    agent_id: Bytes32,
+    policy_id: Bytes32,
+    scope_root: Bytes32,
+    budget_cap: u128,
+    max_per_action: u128,
+    spent: u128,
+    expires_at: u64,
+    status: u8
+  }
+  struct Approval {
+    permit_id: Bytes32,
+    action_hash: Bytes32,
+    amount: u128,
+    status: u8,
+    reviewer: Address,
+    created_at: u64
+  }
+  struct Receipt {
+    permit_id: Bytes32,
+    action_hash: Bytes32,
+    amount: u128,
+    result: u8,
+    previous_hash: Bytes32,
+    created_at: u64
+  }
+
+  program {
+    fn register_agent(self, agent_id: Bytes32, controller: Address) {
+      assert(self.sender == self.owner);
+      self.agents.insert(agent_id, Agent { controller, active: true });
+      emit AgentRegistered(agent_id, controller);
+    }
+
+    fn publish_policy(self, policy_id: Bytes32, policy_hash: Bytes32, version: u32) {
+      assert(self.sender == self.owner);
+      self.policies.insert(policy_id, Policy { policy_hash, version, active: true });
+      emit PolicyPublished(policy_id, policy_hash, version);
+    }
+
+    fn issue_permit(self, permit_id: Bytes32, agent_id: Bytes32, policy_id: Bytes32, scope_root: Bytes32, budget_cap: u128, max_per_action: u128, expires_at: u64) {
+      assert(self.sender == self.owner);
+      assert(!self.globally_paused);
+      assert(expires_at > block.timestamp);
+      assert(self.agents.get(agent_id).active);
+      assert(self.policies.get(policy_id).active);
+      self.permits.insert(permit_id, Permit { agent_id, policy_id, scope_root, budget_cap, max_per_action, spent: 0, expires_at, status: 1 });
+      emit PermitIssued(permit_id, agent_id, policy_id, expires_at);
+      AFTER wait until block.timestamp >= expires_at Do self.expire_permit(permit_id);
+    }
+
+    fn authorize_and_consume(self, permit_id: Bytes32, action_hash: Bytes32, scope_proof: Bytes, amount: u128, receipt_id: Bytes32, previous_hash: Bytes32) -> bool {
+      assert(!self.globally_paused);
+      let permit = self.permits.get(permit_id);
+      assert(permit.status == 1);
+      assert(block.timestamp < permit.expires_at);
+      assert(self.agents.get(permit.agent_id).active);
+      assert(self.agents.get(permit.agent_id).controller == self.sender);
+      assert(self.policies.get(permit.policy_id).active);
+      assert(verify_merkle(scope_proof, action_hash, permit.scope_root));
+      assert(amount <= permit.max_per_action);
+      assert(permit.spent + amount <= permit.budget_cap);
+      permit.spent = permit.spent + amount;
+      self.permits.insert(permit_id, permit);
+      self.receipts.insert(receipt_id, Receipt { permit_id, action_hash, amount, result: 1, previous_hash, created_at: block.timestamp });
+      emit ActionAuthorized(receipt_id, permit_id, action_hash, amount);
+      return true;
+    }
+
+    fn request_approval(self, approval_id: Bytes32, permit_id: Bytes32, action_hash: Bytes32, amount: u128) {
+      let permit = self.permits.get(permit_id);
+      assert(self.agents.get(permit.agent_id).controller == self.sender);
+      self.approvals.insert(approval_id, Approval { permit_id, action_hash, amount, status: 1, reviewer: self.owner, created_at: block.timestamp });
+      emit ApprovalRequested(approval_id, permit_id, action_hash, amount);
+    }
+
+    fn decide_approval(self, approval_id: Bytes32, approved: bool) {
+      assert(self.sender == self.owner);
+      let approval = self.approvals.get(approval_id);
+      assert(approval.status == 1);
+      approval.status = if approved { 2 } else { 3 };
+      self.approvals.insert(approval_id, approval);
+      emit ApprovalDecided(approval_id, approved, self.sender);
+    }
+
+    fn register_credential_hash(self, credential_id: Bytes32, metadata_hash: Bytes32) {
+      assert(self.sender == self.owner);
+      self.credential_hashes.insert(credential_id, metadata_hash);
+      emit CredentialRegistered(credential_id, metadata_hash);
+    }
+
+    fn record_denial(self, permit_id: Bytes32, action_hash: Bytes32, receipt_id: Bytes32, previous_hash: Bytes32, result: u8) {
+      assert(result == 2 || result == 3 || result == 4);
+      self.receipts.insert(receipt_id, Receipt { permit_id, action_hash, amount: 0, result, previous_hash, created_at: block.timestamp });
+      emit ActionDenied(receipt_id, permit_id, result);
+    }
+
+    fn revoke_permit(self, permit_id: Bytes32) {
+      assert(self.sender == self.owner);
+      let permit = self.permits.get(permit_id);
+      permit.status = 2;
+      self.permits.insert(permit_id, permit);
+      emit PermitRevoked(permit_id);
+    }
+
+    fn emergency_stop(self, incident_hash: Bytes32) {
+      assert(self.sender == self.owner);
+      self.globally_paused = true;
+      emit EmergencyStop(incident_hash, block.timestamp);
+    }
+
+    fn emergency_resume(self, resolution_hash: Bytes32) {
+      assert(self.sender == self.owner);
+      self.globally_paused = false;
+      emit EmergencyResume(resolution_hash, block.timestamp);
+    }
+
+    fn expire_permit(self, permit_id: Bytes32) {
+      let permit = self.permits.get(permit_id);
+      if permit.status == 1 && block.timestamp >= permit.expires_at {
+        permit.status = 3;
+        self.permits.insert(permit_id, permit);
+        emit PermitExpired(permit_id);
+      }
+    }
+  }
+}

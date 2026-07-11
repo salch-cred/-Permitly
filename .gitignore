@@ -1,0 +1,13 @@
+.env
+node_modules/
+data/
+data/*.json
+secrets/
+dist/
+*.zip
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/

@@ -1,0 +1,33 @@
+services:
+  app:
+    build: .
+    ports: ["8787:8787"]
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      DATA_DIR: /app/data
+      SAAS_DATABASE_PATH: /app/data/saas.db
+      SESSION_SECRET: ${SESSION_SECRET}
+      RECEIPT_SIGNING_SECRET: ${RECEIPT_SIGNING_SECRET}
+      VAULT_MASTER_SECRET: ${VAULT_MASTER_SECRET}
+      AGENTPERMIT_ADMIN_TOKEN: ${AGENTPERMIT_ADMIN_TOKEN}
+      RIALO_MODE: ${RIALO_MODE:-mock}
+      RIALO_RPC_URL: ${RIALO_RPC_URL:-}
+    volumes: ["agentpermit_data:/app/data"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: agentpermit
+      POSTGRES_USER: agentpermit
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports: ["5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data", "./database/postgres:/docker-entrypoint-initdb.d:ro"]
+    profiles: ["production-db"]
+volumes:
+  agentpermit_data:
+  postgres_data:
