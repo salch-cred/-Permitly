@@ -43,3 +43,15 @@ export function createApiKey(prefix = 'ap_live') {
 }
 
 export function hashApiKey(raw) { return crypto.createHash('sha256').update(String(raw)).digest('hex'); }
+
+export function createResetToken() {
+  const token = crypto.randomBytes(32).toString('hex');
+  const hash = crypto.createHash('sha256').update(token).digest('hex');
+  return { token, hash };
+}
+
+export function createInviteToken() {
+  const token = crypto.randomBytes(24).toString('hex');
+  const hash = crypto.createHash('sha256').update(token).digest('hex');
+  return { token, hash };
+}

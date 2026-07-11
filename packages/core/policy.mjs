@@ -41,6 +41,35 @@ export function evaluatePermit({ permit, request, receipts = [], now = new Date(
     return deny('target_denied', 'Target is not on the permit allowlist');
   }
 
+  // Evaluate policy conditions
+  for (const cond of (permit.conditions || [])) {
+    const fieldValue = request[cond.field] !== undefined ? request[cond.field] : request.context?.[cond.field];
+    if (fieldValue === undefined) continue;
+    let passes = false;
+    switch (cond.operator) {
+      case 'eq':      passes = String(fieldValue) === String(cond.value); break;
+      case 'neq':     passes = String(fieldValue) !== String(cond.value); break;
+      case 'lte':     passes = Number(fieldValue) <= Number(cond.value); break;
+      case 'lt':      passes = Number(fieldValue) < Number(cond.value); break;
+      case 'gte':     passes = Number(fieldValue) >= Number(cond.value); break;
+      case 'gt':      passes = Number(fieldValue) > Number(cond.value); break;
+      case 'in':      passes = Array.isArray(cond.value) ? cond.value.includes(fieldValue) : fieldValue === cond.value; break;
+      case 'not_in':  passes = Array.isArray(cond.value) ? !cond.value.includes(fieldValue) : fieldValue !== cond.value; break;
+      case 'between': { const [lo, hi] = cond.value; passes = Number(fieldValue) >= Number(lo) && Number(fieldValue) <= Number(hi); break; }
+      default: passes = true;
+    }
+    if (!passes) return deny('condition_failed', `Condition not met: ${cond.field} ${cond.operator} ${JSON.stringify(cond.value)}`);
+  }
+
+  // Time-of-day restriction (allowedHoursUtc: [startHour, endHour])
+  if (Array.isArray(permit.allowedHoursUtc) && permit.allowedHoursUtc.length === 2) {
+    const [startH, endH] = permit.allowedHoursUtc;
+    const h = now.getUTCHours();
+    if (!(h >= startH && h < endH)) {
+      return deny('time_restricted', `Action only allowed ${startH}:00–${endH}:00 UTC (now: ${h}:00 UTC)`);
+    }
+  }
+
   if (permit.requireHumanAbove != null && amount > Number(permit.requireHumanAbove)) {
     return escalate('human_threshold', `Amount requires human approval above ${permit.requireHumanAbove}`);
   }

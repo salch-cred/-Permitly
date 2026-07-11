@@ -1,3 +1,6 @@
+// ── Dark mode ──
+const applyDark=on=>{document.documentElement.classList.toggle('dark',on);$('darkToggle').textContent=on?'☀️':'🌙'};
+applyDark(localStorage.getItem('permitly_dark')==='1');
 const token=localStorage.getItem('permitly_session')||'change-me-in-production';
 const $=id=>document.getElementById(id);
 const api=async(p,o={})=>{const r=await fetch('/api'+p,{...o,headers:{'content-type':'application/json','authorization':`Bearer ${token}`,...o.headers}});const j=await r.json();if(!r.ok)throw new Error(j.message||j.error||`HTTP ${r.status}`);return j};
@@ -12,8 +15,14 @@ async function load(){
   const paths=['/health','/summary','/agents','/policies','/permits','/receipts','/approvals','/credentials','/securityEvents','/incidents','/security/rules'];
   const [health,summary,agents,policies,permits,receipts,approvals,credentials,securityEvents,incidents,rules]=await Promise.all(paths.map(p=>api(p)));
   data={health,summary,agents:agents.items,policies:policies.items,permits:permits.items,receipts:receipts.items,approvals:approvals.items,credentials:credentials.items,securityEvents:securityEvents.items,incidents:incidents.items,rules:rules.items};
+  // Live Rialo balance (rpc mode only)
+  if(health?.rialo?.mode==='rpc'){
+    try{const rb=await api('/rialo/balance');if(rb.balance){const rlo=(Number(rb.balance)/1e9).toFixed(2);$('rialoBalance').textContent=`${rlo} $RLO`;$('rialoBalance').style.display='';}}catch{}
+  }
   render();
 }
+// Auto-refresh every 10 seconds
+setInterval(()=>load().catch(()=>{}),10000);
 
 function render(){
   $('chainMode').textContent=`${data.health.rialo.mode} · ${data.health.rialo.connected?'connected':'offline'}`;
@@ -21,10 +30,11 @@ function render(){
   $('emergencyBanner').classList.toggle('show',data.summary.emergencyStopped);
   $('killSwitch').textContent=data.summary.emergencyStopped?'⏻ Emergency active':'⏻ Emergency stop';
   $('metrics').innerHTML=[['Active agents',data.summary.activeAgents],['Active permits',data.permits.filter(x=>x.status==='active').length],['Pending approvals',data.summary.pendingApprovals],['Security events',data.summary.securityEvents]].map(x=>`<div class="card metric"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
-  $('agentRows').innerHTML=data.agents.map(a=>`<tr><td><b>${a.name}</b></td><td>${a.type}</td><td>${pill(a.status)}</td><td><div class="risk-meter"><span style="width:${a.risk}%"></span></div>${a.risk}</td><td><button class="tiny danger" data-stop-agent="${a.id}" ${a.status==='paused'?'disabled':''}>Stop</button></td></tr>`).join('');
-  $('permitRows').innerHTML=data.permits.map(p=>`<tr><td><code>${p.id}</code></td><td>${agentName(p.agentId)}</td><td>${p.scopes.join(', ')}</td><td>$${p.budgetCap}</td><td>${pill(p.status)}</td><td>${new Date(p.expiresAt).toLocaleString()}</td></tr>`).join('');
+  $('agentRows').innerHTML=data.agents.map(a=>`<tr><td><b>${a.name}</b></td><td>${a.type}</td><td>${pill(a.status)}</td><td><div class="risk-meter"><span style="width:${a.risk}%"></span></div>${a.risk}</td><td style="display:flex;gap:5px"><button class="tiny danger" data-stop-agent="${a.id}" ${a.status==='paused'?'disabled':''}>Stop</button><button class="tiny" data-bulk-revoke="${a.id}" title="Revoke all permits">Revoke all</button></td></tr>`).join('');
+  $('permitRows').innerHTML=data.permits.map(p=>`<tr><td><code>${p.id.slice(0,18)}…</code></td><td>${agentName(p.agentId)}</td><td>${p.scopes.join(', ')}</td><td>$${p.budgetCap}</td><td>${pill(p.status)}</td><td>${new Date(p.expiresAt).toLocaleString()}</td><td><button class="tiny" data-clone-permit="${p.id}" title="Clone permit">Clone</button></td></tr>`).join('');
   $('policyCards').innerHTML=data.policies.map(p=>`<article class="policy-card"><div class="policy-card-top"><span class="policy-icon">◆</span>${pill(p.status)}</div><h3>${p.name}</h3><p>${p.scopes.join(' · ')}</p><div class="policy-stats"><span><b>$${p.budgetCap}</b>Total</span><span><b>$${p.maxPerAction}</b>Per action</span><span><b>${p.rateLimitPerMinute}</b>/min</span></div><div class="condition-chip">IF ${p.conditions?.[0]?.field||'request'} ${p.conditions?.[0]?.operator||'matches'} ${Array.isArray(p.conditions?.[0]?.value)?p.conditions[0].value.join(', '):p.conditions?.[0]?.value??'policy'}</div><small>Version ${p.version||1}</small></article>`).join('');
-  $('receiptRows').innerHTML=data.receipts.slice().reverse().map(r=>`<tr><td>${r.id.slice(0,14)}…</td><td>${agentName(r.agentId)}</td><td>${r.scope}</td><td>$${r.amount}</td><td>${pill(r.result)}</td><td><code>${r.hash.slice(0,10)}…</code></td></tr>`).join('')||'<tr><td colspan="6">No receipts yet.</td></tr>';
+  const rialoExplorer='https://explorer.rialo.io/tx/';
+  $('receiptRows').innerHTML=data.receipts.slice().reverse().map(r=>`<tr><td>${r.id.slice(0,14)}…</td><td>${agentName(r.agentId)}</td><td>${r.scope}</td><td>$${r.amount}</td><td>${pill(r.result)}</td><td><code>${r.hash.slice(0,10)}…</code></td><td><a href="${rialoExplorer}${r.hash}" target="_blank" style="font-size:11px;color:var(--blue)">↗</a></td></tr>`).join('')||'<tr><td colspan="7">No receipts yet.</td></tr>';
   $('permitMini').innerHTML=data.permits.filter(p=>p.status==='active').slice(0,4).map(p=>`<div class="notice"><b>${agentName(p.agentId)}</b> · ${p.scopes.join(', ')} · $${p.budgetCap}</div>`).join('')||'<div class="muted">No active permits</div>';
   $('decisionMini').innerHTML=data.receipts.slice(-4).reverse().map(r=>`<div class="notice">${pill(r.result)} ${r.scope}</div>`).join('')||'<div class="muted">No decisions yet</div>';
   $('approvalCards').innerHTML=data.approvals.slice().reverse().map(a=>`<article class="approval-card"><div><div class="approval-title">${agentName(a.agentId)} requests <b>${a.action?.scope||'action'}</b></div><div class="muted">${a.reason}</div><div class="approval-meta"><span>Target: ${a.action?.target||'—'}</span><span>Amount: $${a.action?.amount||0}</span><span>${new Date(a.createdAt).toLocaleString()}</span></div></div><div class="approval-actions">${a.status==='pending'?`<button class="tiny approve" data-approve="${a.id}">Approve</button><button class="tiny danger" data-deny="${a.id}">Deny</button>`:pill(a.status)}</div></article>`).join('')||'<div class="empty-state">No approval requests.</div>';
@@ -42,6 +52,16 @@ function bindDynamicActions(){
   document.querySelectorAll('[data-deny]').forEach(b=>b.onclick=()=>decideApproval(b.dataset.deny,'deny'));
   document.querySelectorAll('[data-stop-agent]').forEach(b=>b.onclick=()=>stopAgent(b.dataset.stopAgent));
   document.querySelectorAll('[data-revoke-credential]').forEach(b=>b.onclick=()=>revokeCredential(b.dataset.revokeCredential));
+  document.querySelectorAll('[data-bulk-revoke]').forEach(b=>b.onclick=()=>bulkRevokePermits(b.dataset.bulkRevoke));
+  document.querySelectorAll('[data-clone-permit]').forEach(b=>b.onclick=()=>clonePermit(b.dataset.clonePermit));
+}
+async function bulkRevokePermits(agentId){
+  const name=agentName(agentId);
+  if(!confirm(`Revoke ALL active permits for ${name}? This cannot be undone.`))return;
+  try{const r=await api(`/agents/${agentId}/revoke-permits`,{method:'POST',body:JSON.stringify({})});toast(`${r.revoked} permit(s) revoked for ${name}`,'ok');await load();}catch(e){toast(e.message,'bad');}
+}
+async function clonePermit(permitId){
+  try{const r=await api(`/permits/${permitId}/clone`,{method:'POST',body:JSON.stringify({})});toast(`Permit cloned → ${r.permit.id.slice(0,18)}…`);await load();}catch(e){toast(e.message,'bad');}
 }
 async function decideApproval(id,action){try{await api(`/approvals/${id}/${action}`,{method:'POST',body:JSON.stringify({reviewer:'Mahammad Salman'})});toast(`Request ${action}d`);await load()}catch(e){toast(e.message,'bad')}}
 async function stopAgent(agentId){if(!confirm(`Emergency stop ${agentName(agentId)}? Active permits will be revoked.`))return;try{await api('/emergency-stop',{method:'POST',body:JSON.stringify({agentId,reason:'Stopped from agent directory'})});toast(`${agentName(agentId)} stopped`);await load()}catch(e){toast(e.message,'bad')}}
@@ -52,7 +72,7 @@ document.querySelectorAll('.navlink').forEach(n=>n.onclick=()=>{document.querySe
 document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>close(b.dataset.close));
 $('newPermit').onclick=()=>open('permitDrawer');$('newPolicy').onclick=()=>open('policyDrawer');$('newCredential').onclick=()=>open('credentialDrawer');$('killSwitch').onclick=()=>open('killDrawer');
 
-$('permitForm').onsubmit=async e=>{e.preventDefault();try{await api('/permits',{method:'POST',body:JSON.stringify({agentId:$('agent').value,scopes:$('scopes').value.split(',').map(x=>x.trim()),budgetCap:+$('budget').value,maxPerAction:+$('perAction').value,requireHumanAbove:+$('human').value,expiresAt:new Date(Date.now()+$('hours').value*3600000).toISOString()})});close('permitDrawer');toast('Permit issued and anchored');await load()}catch(e){toast(e.message,'bad')}};
+$('permitForm').onsubmit=async e=>{e.preventDefault();const sh=$('startHour')?.value,eh=$('endHour')?.value;const permitBody={agentId:$('agent').value,scopes:$('scopes').value.split(',').map(x=>x.trim()),budgetCap:+$('budget').value,maxPerAction:+$('perAction').value,requireHumanAbove:+$('human').value,expiresAt:new Date(Date.now()+$('hours').value*3600000).toISOString()};if(sh&&eh)permitBody.allowedHoursUtc=[+sh,+eh];try{await api('/permits',{method:'POST',body:JSON.stringify(permitBody)});close('permitDrawer');toast('Permit issued and anchored');await load()}catch(e){toast(e.message,'bad')}};
 function updatePolicyPreview(){const value=$('conditionValue').value;$('policyPreview').innerHTML=`<span>ALLOW</span> ${$('policyScopes').value||'scope'} <b>IF</b> ${$('conditionField').value} ${$('conditionOperator').value} ${value||'value'} <b>AND</b> amount ≤ $${$('policyPerAction').value||0}`}
 ['policyScopes','conditionField','conditionOperator','conditionValue','policyPerAction'].forEach(id=>$(id).oninput=updatePolicyPreview);updatePolicyPreview();
 $('policyForm').onsubmit=async e=>{e.preventDefault();let value=$('conditionValue').value;if($('conditionOperator').value==='in')value=value.split(',').map(x=>x.trim());else if(!Number.isNaN(Number(value))&&value!=='')value=Number(value);try{await api('/policies',{method:'POST',body:JSON.stringify({name:$('policyName').value,scopes:$('policyScopes').value.split(',').map(x=>x.trim()),budgetCap:+$('policyBudget').value,maxPerAction:+$('policyPerAction').value,requireHumanAbove:+$('policyHuman').value,rateLimitPerMinute:+$('policyRate').value,conditions:[{field:$('conditionField').value,operator:$('conditionOperator').value,value}]})});close('policyDrawer');toast('Policy published to Rialo adapter');e.target.reset();await load()}catch(e){toast(e.message,'bad')}};
@@ -60,4 +80,6 @@ $('credentialForm').onsubmit=async e=>{e.preventDefault();const type=$('credenti
 $('scanButton').onclick=async()=>{try{const r=await api('/security/scan',{method:'POST',body:JSON.stringify({content:$('scanInput').value})});$('scanResult').innerHTML=`<div class="scan-result ${r.level}"><b>${r.level.toUpperCase()} RISK · ${r.score}/100</b><p>${r.matches.length?r.matches.map(x=>x.label).join(' · '):'No injection patterns detected.'}</p><span>Recommendation: ${r.recommendation}</span></div>`;await load()}catch(e){toast(e.message,'bad')}};
 $('confirmKill').onclick=async()=>{try{await api('/emergency-stop',{method:'POST',body:JSON.stringify({reason:$('killReason').value})});close('killDrawer');toast('Workspace emergency stop activated','bad');await load()}catch(e){toast(e.message,'bad')}};
 $('resumeWorkspace').onclick=async()=>{if(!confirm('Resume agents? Revoked permits will remain revoked.'))return;try{await api('/emergency-resume',{method:'POST',body:JSON.stringify({reason:'Incident reviewed by workspace admin'})});toast('Workspace resumed');await load()}catch(e){toast(e.message,'bad')}};
+// Dark mode toggle
+$('darkToggle').onclick=()=>{const on=!document.documentElement.classList.contains('dark');applyDark(on);localStorage.setItem('permitly_dark',on?'1':'0')};
 load().catch(e=>toast(`Dashboard failed: ${e.message}`,'bad'));

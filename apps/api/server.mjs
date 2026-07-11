@@ -10,6 +10,8 @@ import { scanForPromptInjection, firewallRules } from '../../packages/core/firew
 import { encryptCredential, decryptCredential, redactCredential } from '../../packages/core/vault.mjs';
 import { RialoAdapter } from '../../packages/rialo/adapter.mjs';
 import { createPlatformRouter } from './platform-router.mjs';
+import { SlidingWindowRateLimiter } from '../../packages/platform/rate-limit.mjs';
+import { StripeBillingAdapter } from '../../packages/platform/billing.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(__dirname,'../web');
@@ -22,6 +24,9 @@ const store = await new Store(process.env.DATA_DIR || './data').init();
 const rialo = new RialoAdapter({ dataDir: process.env.DATA_DIR || './data' });
 const platform = createPlatformRouter();
 
+const apiLimiter  = new SlidingWindowRateLimiter({ windowMs: 60_000, max: 120 });
+const authLimiter = new SlidingWindowRateLimiter({ windowMs: 60_000, max: 10 });
+const rawBody = req => new Promise((resolve,reject)=>{ const chunks=[]; req.on('data',c=>{chunks.push(c);if(chunks.reduce((s,b)=>s+b.length,0)>1e6)reject(new Error('body too large'));});req.on('end',()=>resolve(Buffer.concat(chunks))); });
 const json = (res,status,payload) => { res.writeHead(status,{'content-type':'application/json','access-control-allow-origin':'*','access-control-allow-headers':'authorization,content-type','access-control-allow-methods':'GET,POST,PATCH,DELETE,OPTIONS'}); res.end(JSON.stringify(payload)); };
 const auth = req => req.headers.authorization === `Bearer ${adminToken}` || Boolean(req.authContext);
 const body = req => new Promise((resolve,reject)=>{ let s=''; req.on('data',c=>{s+=c;if(s.length>1e6)reject(new Error('body too large'));});req.on('end',()=>{try{resolve(s?JSON.parse(s):{});}catch(e){reject(e);}}); });
@@ -62,6 +67,14 @@ async function createDecisionReceipt(request,permit,evaluation,execution=null,ws
 
 async function route(req,res){
   if(req.method==='OPTIONS') return json(res,204,{});
+  // Rate limiting
+  const ip = req.socket?.remoteAddress || 'unknown';
+  const limiter = req.url?.startsWith('/api/v1/auth/') ? authLimiter : apiLimiter;
+  const rate = limiter.consume(ip);
+  if(!rate.allowed){
+    res.writeHead(429,{'content-type':'application/json','retry-after':String(Math.ceil(rate.retryAfterMs/1000)),'access-control-allow-origin':'*'});
+    return res.end(JSON.stringify({error:'rate_limited',retryAfterMs:rate.retryAfterMs}));
+  }
   const url=new URL(req.url,'http://localhost');
   const p=url.pathname;
   if(await platform.handle({req,res,path:p,json,readBody:body})) return;
@@ -72,11 +85,25 @@ async function route(req,res){
   const scoped=k=>store.list(k).filter(x=>x.workspaceId===wsId);
   const getScoped=(k,id)=>{const item=store.get(k,id);return item?.workspaceId===wsId?item:null};
   if(p==='/api/health') return json(res,200,{ok:true,service:'agentpermit',time:nowIso(),rialo:await rialo.health(),emergencyStopped:Boolean(workspace()?.emergencyStopped)});
+  if(p==='/api/rialo/balance' && req.method==='GET'){
+    const health = await rialo.health();
+    let balance = null;
+    const pubKey = process.env.RIALO_PUBLIC_KEY;
+    if(pubKey) { try { const raw = await rialo.getBalance(pubKey); balance = raw !== null ? String(raw) : null; } catch {} }
+    return json(res,200,{...health,balance,publicKey:pubKey||null});
+  }
   if(p==='/api/summary'){
     const receipts=scoped('receipts');
     return json(res,200,{agents:scoped('agents').length,activeAgents:scoped('agents').filter(x=>x.workspaceId===wsId&&x.status==='active').length,policies:scoped('policies').length,permits:scoped('permits').length,receipts:receipts.length,blocked:receipts.filter(x=>x.result==='blocked').length,escalated:receipts.filter(x=>x.result==='escalated').length,pendingApprovals:scoped('approvals').filter(x=>x.status==='pending').length,securityEvents:scoped('securityEvents').length,emergencyStopped:Boolean(workspace()?.emergencyStopped)});
   }
   for(const k of ['agents','policies','permits','receipts','approvals','securityEvents','incidents']) if(p===`/api/${k}` && req.method==='GET') return json(res,200,{items:scoped(k)});
+  if(p==='/api/receipts/export.csv' && req.method==='GET'){
+    const receipts=scoped('receipts');
+    const cols=['id','agentId','permitId','scope','target','amount','result','code','reason','hash','createdAt'];
+    const csv=[cols.join(','),...receipts.map(r=>cols.map(c=>JSON.stringify(r[c]??'')).join(','))].join('\n');
+    res.writeHead(200,{'content-type':'text/csv;charset=utf-8','content-disposition':'attachment; filename="permitly-receipts.csv"','access-control-allow-origin':'*'});
+    return res.end(csv);
+  }
   if(p==='/api/credentials' && req.method==='GET') return json(res,200,{items:scoped('credentials').map(redactCredential)});
   if(p==='/api/security/rules' && req.method==='GET') return json(res,200,{items:firewallRules()});
 
@@ -105,6 +132,28 @@ async function route(req,res){
     return json(res,201,{permit,tx});
   }
 
+  const bulkRevoke=p.match(/^\/api\/agents\/([^/]+)\/revoke-permits$/);
+  if(bulkRevoke && req.method==='POST'){
+    if(!requireAuth(req,res))return;
+    const agent=getScoped('agents',bulkRevoke[1]); if(!agent)return json(res,404,{error:'not_found'});
+    const revokedAt=nowIso();
+    const revoked=await store.updateMany('permits',x=>x.workspaceId===wsId&&x.agentId===bulkRevoke[1]&&x.status==='active',{status:'revoked',revokedAt});
+    const tx=await rialo.record('permits_bulk_revoked',{agentId:bulkRevoke[1],count:revoked.length,revokedAt});
+    return json(res,200,{revoked:revoked.length,tx});
+  }
+
+  const clonePermit=p.match(/^\/api\/permits\/([^/]+)\/clone$/);
+  if(clonePermit && req.method==='POST'){
+    if(!requireAuth(req,res))return;
+    const source=getScoped('permits',clonePermit[1]); if(!source)return json(res,404,{error:'not_found'});
+    const b=await body(req);
+    const {revokedAt:_r,...rest}=source;
+    const clone={...rest,id:id('permit'),issuedAt:nowIso(),expiresAt:b.expiresAt||new Date(Date.now()+86400000).toISOString(),status:'active'};
+    await store.add('permits',clone);
+    const tx=await rialo.record('permit_issued',clone);
+    return json(res,201,{permit:clone,tx});
+  }
+
   const revoke=p.match(/^\/api\/permits\/([^/]+)\/revoke$/);
   if(revoke && req.method==='POST'){
     if(!requireAuth(req,res))return;
@@ -125,6 +174,14 @@ async function route(req,res){
     let execution=null;
     if(evaluation.decision==='authorized') { try{ execution=await executeProtected(request,wsId); } catch(error){ evaluation={decision:'blocked',code:'execution_failed',reason:error.message}; } }
     const {receipt,tx}=await createDecisionReceipt(request,permit,evaluation,execution,wsId);
+    // Auto-update agent risk score based on decision history
+    if(request.agentId){
+      const agentReceipts=store.list('receipts').filter(r=>r.agentId===request.agentId&&r.workspaceId===wsId);
+      if(agentReceipts.length>=3){
+        const bad=agentReceipts.filter(r=>r.result!=='authorized').length;
+        await store.update('agents',request.agentId,{risk:Math.min(100,Math.round((bad/agentReceipts.length)*100))});
+      }
+    }
     let approval=null;
     if(evaluation.decision==='escalated') approval=await store.add('approvals',{id:id('approval'),workspaceId:wsId,receiptId:receipt.id,permitId:request.permitId,agentId:request.agentId,action:{scope:request.scope,target:request.target||null,amount:Number(request.amount||0)},status:'pending',reason:evaluation.reason,createdAt:nowIso()});
     return json(res,200,{evaluation,scan,receipt,approval,tx});
@@ -177,6 +234,21 @@ async function route(req,res){
     const b=await body(req); await store.update('workspaces',wsId,{emergencyStopped:false,resumedAt:nowIso()}); await store.updateMany('agents',x=>x.workspaceId===wsId&&x.status==='paused',{status:'active'});
     const incident={id:id('incident'),workspaceId:wsId,type:'emergency_resume',scope:'workspace',reason:b.reason||'Manual resume',status:'resolved',createdAt:nowIso()};
     await store.add('incidents',incident); const tx=await rialo.record('emergency_resume',incident); return json(res,200,{incident,warning:'Previously revoked permits remain revoked and must be reissued',tx});
+  }
+
+  // Stripe webhook
+  if(p==='/api/webhooks/stripe' && req.method==='POST'){
+    const raw=await rawBody(req);
+    try{
+      const billing=new StripeBillingAdapter();
+      const event=billing.verifyEvent(raw.toString(),req.headers['stripe-signature']||'');
+      if(event.type==='checkout.session.completed'){
+        const wsTarget=event.data?.object?.metadata?.workspace_id;
+        const plan=event.data?.object?.metadata?.plan;
+        if(wsTarget&&plan) await store.update('workspaces',wsTarget,{plan});
+      }
+      return json(res,200,{received:true,type:event.type});
+    }catch(e){return json(res,400,{error:e.message});}
   }
 
   const verify=p.match(/^\/api\/receipts\/([^/]+)\/verify$/);
