@@ -81,6 +81,16 @@ Agent → Permit Gateway → Policy Engine → Multi-sig → Staking → Receipt
 
 30+ events covering every state change: `AgentRegistered`, `DelegationCreated`, `RoleCreated`, `PolicyPublished`, `PermitIssued`, `PermitMigrated`, `PermitFrozen`, `ApprovalRequested`, `VoteCast`, `ApprovalDecided`, `StakeDeposited`, `StakeSlashed`, `TimelockScheduled`, `TimelockExecuted`, `PolicyMigrationStarted`, `PolicyMigrationCompleted`, and more.
 
+## Deployment status
+
+**AgentPermit v4 is live on Rialo devnet:**
+- **Program ID:** `2RdznG7VJYGWaDyfZAWcuCBCbQ1cknMuZdDKfSVvTJgh`
+- **Binary:** 87.7 KB (PolkaVM RISC-V)
+- **Deployed:** 2026-07-11
+- **Chain:** `rialo:devnet`
+- **RPC:** `https://devnet.rialo.io:4101`
+- **Deployer:** `8rpTEo1DqGvu5Y1Kxk9tycSDXF6wLUnWBiywnZHack4P`
+
 ## Production deployment
 
 ### Prerequisites
@@ -116,7 +126,7 @@ RIALO_MODE=rpc npm run smoke
 RIALO_MODE=mock|rpc
 RIALO_RPC_URL=https://devnet.rialo.io:4101
 RIALO_CHAIN_ID=rialo:devnet
-RIALO_PROGRAM_ID=<from deploy step>
+RIALO_PROGRAM_ID=2RdznG7VJYGWaDyfZAWcuCBCbQ1cknMuZdDKfSVvTJgh  # AgentPermit v4
 RIALO_DEPLOYER_KEY_PATH=./secrets/deployer.json
 ```
 
