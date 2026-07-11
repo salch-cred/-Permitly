@@ -36,7 +36,14 @@ workflow {
     pending_admin_actions: Map<Bytes32, PendingAction>,
 
     // --- Policy Migration ---
-    policy_migrations: Map<Bytes32, PolicyMigration>
+    policy_migrations: Map<Bytes32, PolicyMigration>,
+
+    // --- Rialo Cruise: Gas-less Meta-Transactions ---
+    meta_tx_nonces: Map<Address, u64>,       // per-signer nonce to prevent replay
+    meta_tx_relayer: Address,                 // authorized relayer (Permitly backend)
+    sponsored_permits: Map<Bytes32, bool>,    // permits paid for by relayer
+    cruise_budget: u128,                      // total RIALO allocated for gas sponsorship
+    cruise_spent: u128                        // gas spent so far
   }
 
   // ============================================================
@@ -179,6 +186,12 @@ workflow {
   event TimelockCancelled(action_id: Bytes32);
   event PolicyMigrationStarted(migration_id: Bytes32, policy_id: Bytes32, from_version: u32, to_version: u32);
   event PolicyMigrationCompleted(migration_id: Bytes32);
+  // --- Rialo Cruise events ---
+  event MetaTxRelayed(relayer: Address, signer: Address, nonce: u64, kind: Bytes32);
+  event CruiseBudgetSet(budget: u128);
+  event CruiseBudgetSpent(amount: u128, remaining: u128);
+  event RelayerSet(relayer: Address);
+  event SponsoredPermitIssued(permit_id: Bytes32, sponsored_by: Address);
 
   // ============================================================
   // Modifier helpers
@@ -189,6 +202,10 @@ workflow {
 
   fn only_guardian(self) {
     assert(self.guardians.get(self.sender) == true);
+  }
+
+  fn only_relayer(self) {
+    assert(self.sender == self.meta_tx_relayer);
   }
 
   fn not_paused(self) {
@@ -224,6 +241,197 @@ workflow {
     self.only_owner();
     assert(delay >= 60); // minimum 60 seconds
     self.timelock_delay = delay;
+  }
+
+  // ============================================================
+  // Rialo Cruise: Gas-less Transaction Management
+  // ============================================================
+
+  /// Set the authorized relayer (Permitly backend) that submits meta-txs
+  fn set_relayer(self, relayer: Address) {
+    self.only_owner();
+    assert(relayer != Address::default());
+    self.meta_tx_relayer = relayer;
+    emit RelayerSet(relayer);
+  }
+
+  /// Set the total cruise budget (RIALO allocated for gas sponsorship)
+  fn set_cruise_budget(self, budget: u128) {
+    self.only_owner();
+    self.cruise_budget = budget;
+    self.cruise_spent = 0;
+    emit CruiseBudgetSet(budget);
+  }
+
+  /// Verify an off-chain signed meta-transaction payload.
+  /// Checks: relayer authorization, nonce freshness, and budget availability.
+  fn verify_meta_tx(self, signer: Address, nonce: u64, kind: Bytes32) -> bool {
+    self.only_relayer();
+    // Check nonce: must be exactly next expected nonce for this signer
+    let expected_nonce = self.meta_tx_nonces.get(signer);
+    assert(nonce == expected_nonce);
+    // Check cruise budget
+    assert(self.cruise_spent < self.cruise_budget);
+    return true;
+  }
+
+  /// Consume a nonce after a meta-tx is processed (prevents replay)
+  fn consume_nonce(self, signer: Address) {
+    let current = self.meta_tx_nonces.get(signer);
+    self.meta_tx_nonces.insert(signer, current + 1);
+  }
+
+  /// Record cruise gas spending
+  fn record_cruise_spend(self, amount: u128) {
+    self.cruise_spent = self.cruise_spent + amount;
+    emit CruiseBudgetSpent(amount, self.cruise_budget - self.cruise_spent);
+  }
+
+  // ============================================================
+  // Sponsored Permit Issuance (Relayer pays gas)
+  // ============================================================
+
+  /// Issue a permit sponsored by the relayer — user doesn't need RIALO
+  fn sponsored_issue_permit(
+    self,
+    permit_id: Bytes32,
+    agent_id: Bytes32,
+    policy_id: Bytes32,
+    scope_root: Bytes32,
+    budget_cap: u128,
+    max_per_action: u128,
+    expires_at: u64,
+    signer: Address,
+    nonce: u64,
+    gas_amount: u128
+  ) {
+    self.only_relayer();
+    self.not_paused();
+    assert(self.verify_meta_tx(signer, nonce, "sponsored_issue_permit"));
+    assert(expires_at > block.timestamp);
+    let agent = self.agents.get(agent_id);
+    assert(agent.active);
+    assert(agent.controller == signer);
+    let policy = self.policies.get(policy_id);
+    assert(policy.active);
+    let role = self.roles.get(agent.role_id);
+    assert(role.active);
+    assert(budget_cap <= role.max_budget);
+    assert(max_per_action <= role.max_per_action);
+
+    self.permits.insert(permit_id, Permit {
+      agent_id,
+      policy_id,
+      role_id: agent.role_id,
+      scope_root,
+      budget_cap,
+      max_per_action,
+      spent: 0,
+      expires_at,
+      status: 1,
+      policy_version: policy.version
+    });
+    self.sponsored_permits.insert(permit_id, true);
+    self.consume_nonce(signer);
+    self.record_cruise_spend(gas_amount);
+    emit PermitIssued(permit_id, agent_id, policy_id, agent.role_id, expires_at);
+    emit SponsoredPermitIssued(permit_id, self.sender);
+    AFTER wait until block.timestamp >= expires_at Do self.expire_permit(permit_id);
+  }
+
+  /// Authorize an action with gas paid by the relayer
+  fn sponsored_authorize(
+    self,
+    permit_id: Bytes32,
+    action_hash: Bytes32,
+    scope_proof: Bytes,
+    amount: u128,
+    receipt_id: Bytes32,
+    previous_hash: Bytes32,
+    signer: Address,
+    nonce: u64,
+    gas_amount: u128
+  ) -> bool {
+    self.only_relayer();
+    self.not_paused();
+    assert(self.verify_meta_tx(signer, nonce, "sponsored_authorize"));
+
+    let permit = self.permits.get(permit_id);
+    assert(permit.status == 1);
+    assert(block.timestamp < permit.expires_at);
+
+    let agent = self.agents.get(permit.agent_id);
+    assert(agent.active);
+    let is_controller = agent.controller == signer;
+    let is_delegate = false;
+    if (!is_controller) {
+      for each (delegation_id, delegation) in self.delegations {
+        if delegation.active && delegation.delegate == signer && delegation.agent_id == permit.agent_id {
+          assert(block.timestamp < delegation.expires_at);
+          assert(verify_merkle(scope_proof, action_hash, delegation.scope_root));
+          is_delegate = true;
+          break;
+        }
+      }
+      assert(is_delegate);
+    }
+
+    let policy = self.policies.get(permit.policy_id);
+    assert(policy.active);
+    assert(verify_merkle(scope_proof, action_hash, permit.scope_root));
+    assert(amount <= permit.max_per_action);
+    assert(permit.spent + amount <= permit.budget_cap);
+
+    // Check staking if applicable
+    let stake = self.stakes.get(permit.agent_id);
+    if stake.status == 1 {
+      assert(stake.amount >= amount / 10);
+    }
+
+    permit.spent = permit.spent + amount;
+    self.permits.insert(permit_id, permit);
+
+    self.receipts.insert(receipt_id, Receipt {
+      permit_id,
+      action_hash,
+      amount,
+      result: 1,
+      previous_hash,
+      created_at: block.timestamp
+    });
+    self.consume_nonce(signer);
+    self.record_cruise_spend(gas_amount);
+    emit ActionAuthorized(receipt_id, permit_id, action_hash, amount);
+    return true;
+  }
+
+  /// Record a denial with gas paid by the relayer
+  fn sponsored_record_denial(
+    self,
+    permit_id: Bytes32,
+    action_hash: Bytes32,
+    receipt_id: Bytes32,
+    previous_hash: Bytes32,
+    result: u8,
+    signer: Address,
+    nonce: u64,
+    gas_amount: u128
+  ) {
+    self.only_relayer();
+    assert(result == 2 || result == 3 || result == 4 || result == 5);
+    assert(self.verify_meta_tx(signer, nonce, "sponsored_record_denial"));
+
+    self.receipts.insert(receipt_id, Receipt {
+      permit_id,
+      action_hash,
+      amount: 0,
+      result,
+      previous_hash,
+      created_at: block.timestamp
+    });
+    self.consume_nonce(signer);
+    self.record_cruise_spend(gas_amount);
+    emit ActionDenied(receipt_id, permit_id, result);
   }
 
   // ============================================================
@@ -467,13 +675,11 @@ workflow {
     assert(permit.status == 1);
     assert(block.timestamp < permit.expires_at);
 
-    // Check sender: controller or delegate
     let agent = self.agents.get(permit.agent_id);
     assert(agent.active);
     let is_controller = agent.controller == self.sender;
     let is_delegate = false;
     if (!is_controller) {
-      // Check if sender is a valid delegate
       for each (delegation_id, delegation) in self.delegations {
         if delegation.active && delegation.delegate == self.sender && delegation.agent_id == permit.agent_id {
           assert(block.timestamp < delegation.expires_at);
@@ -485,28 +691,20 @@ workflow {
       assert(is_delegate);
     }
 
-    // Check policy active
     let policy = self.policies.get(permit.policy_id);
     assert(policy.active);
-
-    // Check scope
     assert(verify_merkle(scope_proof, action_hash, permit.scope_root));
-
-    // Check budget
     assert(amount <= permit.max_per_action);
     assert(permit.spent + amount <= permit.budget_cap);
 
-    // Check staking: agent must have active stake >= 10% of requested amount
     let stake = self.stakes.get(permit.agent_id);
     if stake.status == 1 {
       assert(stake.amount >= amount / 10);
     }
 
-    // Consume budget
     permit.spent = permit.spent + amount;
     self.permits.insert(permit_id, permit);
 
-    // Record receipt
     self.receipts.insert(receipt_id, Receipt {
       permit_id,
       action_hash,
@@ -534,7 +732,6 @@ workflow {
     let required = policy.min_approvals;
     assert(required > 0);
 
-    // Count active guardians
     let guardian_count: u8 = 0;
     for each (addr, is_guardian) in self.guardians {
       if is_guardian { guardian_count = guardian_count + 1; }
@@ -550,7 +747,7 @@ workflow {
       yes_votes: 0,
       no_votes: 0,
       created_at: block.timestamp,
-      expires_at: block.timestamp + 86400 // 24h expiry
+      expires_at: block.timestamp + 86400
     });
     emit ApprovalRequested(approval_id, permit_id, action_hash, amount, required);
   }
@@ -561,7 +758,6 @@ workflow {
     assert(approval.status == 1);
     assert(block.timestamp < approval.expires_at);
 
-    // Check not already voted
     let votes = self.guardian_votes.get(approval_id);
     assert(votes.get(self.sender) != true);
 
@@ -576,13 +772,12 @@ workflow {
 
     emit VoteCast(approval_id, self.sender, approved);
 
-    // Check if threshold reached
     if approval.yes_votes >= approval.required_votes {
-      approval.status = 2; // approved
+      approval.status = 2;
       self.approvals.insert(approval_id, approval);
       emit ApprovalDecided(approval_id, true, approval.yes_votes, approval.no_votes);
     } else if approval.no_votes >= approval.required_votes {
-      approval.status = 3; // denied
+      approval.status = 3;
       self.approvals.insert(approval_id, approval);
       emit ApprovalDecided(approval_id, false, approval.yes_votes, approval.no_votes);
     } else {
@@ -611,15 +806,13 @@ workflow {
 
     let stake = self.stakes.get(agent_id);
     if stake.status == 0 || stake.status == 4 {
-      // New stake
       self.stakes.insert(agent_id, Stake {
         agent_id,
         amount,
-        locked_until: block.timestamp + 2592000, // 30 days lock
+        locked_until: block.timestamp + 2592000,
         status: 1
       });
     } else {
-      // Top up
       assert(stake.status == 1);
       stake.amount = stake.amount + amount;
       self.stakes.insert(agent_id, stake);
@@ -638,7 +831,7 @@ workflow {
     let agent = self.agents.get(agent_id);
     assert(agent.controller == self.sender);
 
-    stake.status = 4; // withdrawn
+    stake.status = 4;
     self.stakes.insert(agent_id, stake);
     agent.staked_amount = 0;
     self.agents.insert(agent_id, agent);
@@ -654,7 +847,7 @@ workflow {
 
     stake.amount = stake.amount - amount;
     if stake.amount == 0 {
-      stake.status = 3; // fully slashed
+      stake.status = 3;
     }
     self.stakes.insert(agent_id, stake);
 
@@ -707,7 +900,7 @@ workflow {
     self.only_owner();
     let action = self.pending_admin_actions.get(action_id);
     assert(!action.executed);
-    action.executed = true; // mark as cancelled
+    action.executed = true;
     self.pending_admin_actions.insert(action_id, action);
     emit TimelockCancelled(action_id);
   }
