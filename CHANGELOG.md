@@ -1,5 +1,21 @@
 # Changelog
 
+## 4.1.0
+
+- **Rialo Cruise ⛽**: Gas-less meta-transactions — users don't need RIALO tokens
+- **Sponsored permit issuance**: Permits issued with relayer paying gas fees
+- **Sponsored authorization**: Actions authorized with relayer paying gas
+- **Sponsored denial recording**: Denials recorded with relayer paying gas
+- **Meta-transaction relay**: Off-chain signed payloads submitted by Permitly backend
+- **Nonce-based replay protection**: Per-signer monotonically increasing nonces
+- **Cruise budget management**: Configurable gas sponsorship budget with spending tracking
+- **New contract state**: meta_tx_nonces, meta_tx_relayer, sponsored_permits, cruise_budget, cruise_spent
+- **New events**: MetaTxRelayed, CruiseBudgetSet, CruiseBudgetSpent, RelayerSet, SponsoredPermitIssued
+- **New API endpoints**: /api/cruise/status, /api/cruise/nonce/:signer, /api/cruise/sponsored-permit, /api/cruise/relay
+- **New adapter methods**: createMetaTxPayload, signMetaTxPayload, verifyMetaTxSignature, relayMetaTx, getNonce
+- **Cruise smoke tests**: Full test suite for gas-less transaction flow
+- **Updated docs**: Complete Rialo Cruise documentation with architecture diagram and SDK usage
+
 ## 4.0.0
 
 - **Multi-sig Guardians**: N-of-M guardian approval system for high-risk actions
@@ -10,7 +26,7 @@
 - **Policy Migration**: Live migration of permits between policy versions
 - **Freeze/Unfreeze**: Emergency freeze of individual permits without global stop
 - **Expanded Rialo contract**: 30+ events, 40+ functions, 15 state maps
-- **Updated Rialo adapter**: v4 convenience methods, `readByKind`, contract version tracking
+- **Updated Rialo adapter**: v4 convenience methods, readByKind, contract version tracking
 - **Updated deploy script**: v4 metadata, feature tagging, improved output
 - **Comprehensive smoke tests**: Covers all v4 features including multi-sig voting
 
