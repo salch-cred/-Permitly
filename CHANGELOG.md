@@ -1,5 +1,19 @@
 # Changelog
 
+## 4.0.0
+
+- **Multi-sig Guardians**: N-of-M guardian approval system for high-risk actions
+- **Delegation**: Scoped, time-bound delegate authorizations for agents
+- **Role-based Policies**: Roles define scope roots, budgets, delegation/approval permissions
+- **Staking & Slashing**: Agents stake tokens; violations trigger slashing with audit trail
+- **Timelock**: Configurable delay on admin actions before execution
+- **Policy Migration**: Live migration of permits between policy versions
+- **Freeze/Unfreeze**: Emergency freeze of individual permits without global stop
+- **Expanded Rialo contract**: 30+ events, 40+ functions, 15 state maps
+- **Updated Rialo adapter**: v4 convenience methods, `readByKind`, contract version tracking
+- **Updated deploy script**: v4 metadata, feature tagging, improved output
+- **Comprehensive smoke tests**: Covers all v4 features including multi-sig voting
+
 ## 3.0.0
 
 - Added signup, login and workspace account console

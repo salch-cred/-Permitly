@@ -29,6 +29,10 @@ export class RialoAdapter {
     return this._client;
   }
 
+  /**
+   * Record a governance event on the Rialo ledger.
+   * Supports all v4 contract methods: agent ops, policy ops, permits, approvals, staking, delegation, timelock.
+   */
   async record(kind, payload) {
     const envelope = {
       chainId: this.chainId,
@@ -36,14 +40,12 @@ export class RialoAdapter {
       kind,
       payload,
       nonce: Date.now(),
-      version: 1
+      version: 4  // v4 contract
     };
 
     if (this.mode === 'rpc') {
-      // Real Rialo devnet: use sendTransaction via official CDK
       try {
         const client = await this.#getClient();
-        // callWithJson allows arbitrary program invocations on devnet
         const result = await client.callWithJson({
           programId: this.programId,
           method: kind,
@@ -56,7 +58,6 @@ export class RialoAdapter {
           ...envelope
         };
       } catch (error) {
-        // Fall back to mock if RPC call fails (program not yet deployed)
         console.warn(`[RialoAdapter] RPC call failed (${error.message}), using mock fallback`);
         return this.#mockRecord(envelope);
       }
@@ -76,6 +77,9 @@ export class RialoAdapter {
     return tx;
   }
 
+  /**
+   * Read governance records by key (agent ID, permit ID, approval ID, etc.)
+   */
   async read(key) {
     if (this.mode === 'rpc') {
       try {
@@ -89,10 +93,30 @@ export class RialoAdapter {
     const file = path.join(this.dataDir, 'ledger.json');
     try {
       const ledger = JSON.parse(await fs.readFile(file, 'utf8'));
-      return ledger.filter(x => x.payload?.id === key || x.payload?.permitId === key);
+      return ledger.filter(x =>
+        x.payload?.id === key ||
+        x.payload?.permitId === key ||
+        x.payload?.agentId === key ||
+        x.payload?.approvalId === key ||
+        x.payload?.delegationId === key
+      );
     } catch { return []; }
   }
 
+  /**
+   * Read all records of a specific kind (e.g. all permits, all stakes)
+   */
+  async readByKind(kind) {
+    const file = path.join(this.dataDir, 'ledger.json');
+    try {
+      const ledger = JSON.parse(await fs.readFile(file, 'utf8'));
+      return ledger.filter(x => x.kind === kind);
+    } catch { return []; }
+  }
+
+  /**
+   * Health check — returns connection status and chain info
+   */
   async health() {
     if (this.mode === 'rpc') {
       try {
@@ -104,16 +128,32 @@ export class RialoAdapter {
           chainId: this.chainId,
           rpcUrl: this.rpcUrl,
           connected: health === 'ok',
-          blockHeight
+          blockHeight,
+          contractVersion: 4
         };
       } catch (error) {
-        return { mode: 'rpc', chainId: this.chainId, rpcUrl: this.rpcUrl, connected: false, error: error.message };
+        return {
+          mode: 'rpc',
+          chainId: this.chainId,
+          rpcUrl: this.rpcUrl,
+          connected: false,
+          error: error.message,
+          contractVersion: 4
+        };
       }
     }
-    return { mode: 'mock', chainId: this.chainId, programId: this.programId, connected: true };
+    return {
+      mode: 'mock',
+      chainId: this.chainId,
+      programId: this.programId,
+      connected: true,
+      contractVersion: 4
+    };
   }
 
-  // Get live devnet balance for a public key
+  /**
+   * Get live devnet balance for a public key
+   */
   async getBalance(publicKey) {
     try {
       const client = await this.#getClient();
@@ -121,5 +161,54 @@ export class RialoAdapter {
     } catch (error) {
       return null;
     }
+  }
+
+  // ============================================================
+  // Convenience methods for v4 contract operations
+  // ============================================================
+
+  /** Record a permit issuance */
+  async recordPermitIssued(permitId, agentId, policyId, roleId, expiresAt) {
+    return this.record('issuePermit', { permitId, agentId, policyId, roleId, expiresAt });
+  }
+
+  /** Record an action authorization */
+  async recordActionAuthorized(receiptId, permitId, actionHash, amount) {
+    return this.record('authorizeAndConsume', { receiptId, permitId, actionHash, amount });
+  }
+
+  /** Record an approval request (multi-sig) */
+  async recordApprovalRequested(approvalId, permitId, actionHash, amount, requiredVotes) {
+    return this.record('requestApproval', { approvalId, permitId, actionHash, amount, requiredVotes });
+  }
+
+  /** Record a guardian vote */
+  async recordVoteCast(approvalId, guardian, approved) {
+    return this.record('castVote', { approvalId, guardian, approved });
+  }
+
+  /** Record a stake deposit */
+  async recordStakeDeposited(agentId, amount) {
+    return this.record('depositStake', { agentId, amount });
+  }
+
+  /** Record a stake slash */
+  async recordStakeSlashed(agentId, amount, reason, receiptId) {
+    return this.record('slashStake', { agentId, amount, reason, receiptId });
+  }
+
+  /** Record a delegation */
+  async recordDelegationCreated(delegationId, agentId, delegate, scopeRoot, expiresAt) {
+    return this.record('createDelegation', { delegationId, agentId, delegate, scopeRoot, expiresAt });
+  }
+
+  /** Record a timelock action */
+  async recordTimelockScheduled(actionId, targetFn, executesAt) {
+    return this.record('scheduleTimelockAction', { actionId, targetFn, executesAt });
+  }
+
+  /** Record a policy migration */
+  async recordPolicyMigration(migrationId, policyId, fromVersion, toVersion) {
+    return this.record('startPolicyMigration', { migrationId, policyId, fromVersion, toVersion });
   }
 }
