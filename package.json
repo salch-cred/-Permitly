@@ -1,6 +1,6 @@
 {
   "name": "agentpermit-rialo",
-  "version": "3.1.0",
+  "version": "4.1.0",
   "private": true,
   "type": "module",
   "description": "Full-stack permit, policy, execution and receipt layer for AI agents on Rialo",
@@ -9,10 +9,11 @@
     "start": "NODE_ENV=production node apps/api/server.mjs",
     "test": "node --test tests/*.test.mjs",
     "smoke": "node scripts/smoke.mjs",
+    "cruise-smoke": "node scripts/cruise-smoke.mjs",
     "deploy:rialo": "node scripts/deploy-rialo.mjs",
     "keygen": "node scripts/keygen.mjs",
     "smoke:saas": "node scripts/saas-smoke.mjs",
-    "validate": "npm test && npm run smoke:saas && npm run smoke"
+    "validate": "npm test && npm run smoke:saas && npm run smoke && npm run cruise-smoke"
   },
   "engines": {
     "node": ">=20"
