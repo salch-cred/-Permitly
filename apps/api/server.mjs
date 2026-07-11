@@ -20,6 +20,7 @@ const host = process.env.HOST || '127.0.0.1';
 const secret = process.env.RECEIPT_SIGNING_SECRET || 'development-only-secret-change-me';
 const vaultSecret = process.env.VAULT_MASTER_SECRET || secret;
 const adminToken = process.env.AGENTPERMIT_ADMIN_TOKEN || 'change-me-in-production';
+const relayToken = process.env.RIALO_RELAY_TOKEN || 'change-me-in-production';
 const store = await new Store(process.env.DATA_DIR || './data').init();
 const rialo = new RialoAdapter({ dataDir: process.env.DATA_DIR || './data' });
 const platform = createPlatformRouter();
@@ -48,212 +49,263 @@ async function executeProtected(request,wsId){
     if(item?.workspaceId!==wsId) throw new Error('Credential is unavailable');
     if(!item||item.status!=='active') throw new Error('Credential is unavailable');
     const credential=decryptCredential(item.encrypted,vaultSecret);
-    if(credential.type==='bearer') headers.authorization=`Bearer ${credential.token}`;
-    if(credential.type==='api-key') headers[credential.header||'x-api-key']=credential.value;
-    if(credential.headers) Object.assign(headers,credential.headers);
+    if(credential) headers['authorization']=credential.type==='bearer'?`Bearer ${credential.token}`:`Basic ${Buffer.from(`${credential.username}:${credential.password}`).toString('base64')}`;
   }
-  const ctrl = new AbortController(); const timer=setTimeout(()=>ctrl.abort(),5000);
-  try { const r=await fetch(target,{method:request.method||'POST',headers,body:request.payload?JSON.stringify(request.payload):undefined,signal:ctrl.signal}); return {status:r.status,body:(await r.text()).slice(0,5000)}; }
-  finally{clearTimeout(timer);}
-}
-
-async function createDecisionReceipt(request,permit,evaluation,execution=null,wsId='ws_demo'){
-  const previous=store.list('receipts').filter(x=>x.workspaceId===wsId).at(-1)?.hash||'GENESIS';
-  const receipt=createReceipt({request,permit:permit||{id:request.permitId||'missing',workspaceId:wsId},evaluation,execution,previousHash:previous,secret});
-  await store.add('receipts',receipt);
-  const tx=await rialo.record('action_receipt',receipt);
-  return {receipt,tx};
+  const response=await fetch(target,{method:request.method||'POST',headers,body:JSON.stringify(request.body||{})});
+  return {status:response.status,body:await response.text()};
 }
 
 async function route(req,res){
-  if(req.method==='OPTIONS') return json(res,204,{});
-  // Rate limiting
-  const ip = req.socket?.remoteAddress || 'unknown';
-  const limiter = req.url?.startsWith('/api/v1/auth/') ? authLimiter : apiLimiter;
-  const rate = limiter.consume(ip);
-  if(!rate.allowed){
-    res.writeHead(429,{'content-type':'application/json','retry-after':String(Math.ceil(rate.retryAfterMs/1000)),'access-control-allow-origin':'*'});
-    return res.end(JSON.stringify({error:'rate_limited',retryAfterMs:rate.retryAfterMs}));
-  }
-  const url=new URL(req.url,'http://localhost');
-  const p=url.pathname;
-  if(await platform.handle({req,res,path:p,json,readBody:body})) return;
-  req.authContext=await platform.context(req);
-  const wsId=req.authContext?.workspaceId||'ws_demo';
-  if(req.authContext&&!store.get('workspaces',wsId)) await store.add('workspaces',{id:wsId,name:'SaaS workspace',emergencyStopped:false});
-  const workspace=()=>store.get('workspaces',wsId);
-  const scoped=k=>store.list(k).filter(x=>x.workspaceId===wsId);
-  const getScoped=(k,id)=>{const item=store.get(k,id);return item?.workspaceId===wsId?item:null};
-  if(p==='/api/health') return json(res,200,{ok:true,service:'agentpermit',time:nowIso(),rialo:await rialo.health(),emergencyStopped:Boolean(workspace()?.emergencyStopped)});
-  if(p==='/api/rialo/balance' && req.method==='GET'){
-    const health = await rialo.health();
-    let balance = null;
-    const pubKey = process.env.RIALO_PUBLIC_KEY;
-    if(pubKey) { try { const raw = await rialo.getBalance(pubKey); balance = raw !== null ? String(raw) : null; } catch {} }
-    return json(res,200,{...health,balance,publicKey:pubKey||null});
-  }
-  if(p==='/api/summary'){
-    const receipts=scoped('receipts');
-    return json(res,200,{agents:scoped('agents').length,activeAgents:scoped('agents').filter(x=>x.workspaceId===wsId&&x.status==='active').length,policies:scoped('policies').length,permits:scoped('permits').length,receipts:receipts.length,blocked:receipts.filter(x=>x.result==='blocked').length,escalated:receipts.filter(x=>x.result==='escalated').length,pendingApprovals:scoped('approvals').filter(x=>x.status==='pending').length,securityEvents:scoped('securityEvents').length,emergencyStopped:Boolean(workspace()?.emergencyStopped)});
-  }
-  for(const k of ['agents','policies','permits','receipts','approvals','securityEvents','incidents']) if(p===`/api/${k}` && req.method==='GET') return json(res,200,{items:scoped(k)});
-  if(p==='/api/receipts/export.csv' && req.method==='GET'){
-    const receipts=scoped('receipts');
-    const cols=['id','agentId','permitId','scope','target','amount','result','code','reason','hash','createdAt'];
-    const csv=[cols.join(','),...receipts.map(r=>cols.map(c=>JSON.stringify(r[c]??'')).join(','))].join('\n');
-    res.writeHead(200,{'content-type':'text/csv;charset=utf-8','content-disposition':'attachment; filename="permitly-receipts.csv"','access-control-allow-origin':'*'});
-    return res.end(csv);
-  }
-  if(p==='/api/credentials' && req.method==='GET') return json(res,200,{items:scoped('credentials').map(redactCredential)});
-  if(p==='/api/security/rules' && req.method==='GET') return json(res,200,{items:firewallRules()});
+  if(req.method==='OPTIONS') return json(res,200,{});
+  const p=req.url.split('?')[0];
+  const ctx=await platform.context(req);
+  if(ctx) req.authContext=ctx;
 
-  if(p==='/api/agents' && req.method==='POST'){
-    if(!requireAuth(req,res))return; const b=await body(req);
-    const agent={id:id('agent'),workspaceId:wsId,name:b.name,type:b.type||'custom',status:'active',risk:0,createdAt:nowIso()};
-    await store.add('agents',agent); await rialo.record('agent_registered',agent); return json(res,201,{agent});
-  }
-
-  if(p==='/api/policies' && req.method==='POST'){
-    if(!requireAuth(req,res))return;
+  // ---- Rialo Cruise: Gas-less Meta-Transaction Relay ----
+  if(p==='/api/cruise/relay'&&req.method==='POST'){
     const b=await body(req);
-    if(!b.name||!Array.isArray(b.scopes)||!b.scopes.length) return json(res,400,{error:'name_and_scopes_required'});
-    const policy={id:id('pol'),workspaceId:wsId,name:b.name,scopes:b.scopes,budgetCap:Number(b.budgetCap||0),maxPerAction:Number(b.maxPerAction||0),rateLimitPerMinute:Number(b.rateLimitPerMinute||60),requireHumanAbove:Number(b.requireHumanAbove||0),conditions:Array.isArray(b.conditions)?b.conditions:[],status:'active',version:1,createdAt:nowIso()};
-    await store.add('policies',policy); const tx=await rialo.record('policy_published',{...policy,conditionsHash:policy.conditions});
-    return json(res,201,{policy,tx});
-  }
-
-  if(p==='/api/permits' && req.method==='POST'){
-    if(!requireAuth(req,res))return;
-    if(workspace()?.emergencyStopped) return json(res,423,{error:'workspace_emergency_stopped'});
-    const b=await body(req); const issuedAt=nowIso();
-    const permit={id:id('permit'),workspaceId:wsId,agentId:b.agentId,policyId:b.policyId||null,scopes:b.scopes||[],budgetCap:Number(b.budgetCap||0),maxPerAction:b.maxPerAction==null?null:Number(b.maxPerAction),rateLimitPerMinute:Number(b.rateLimitPerMinute||60),requireHumanAbove:b.requireHumanAbove==null?null:Number(b.requireHumanAbove),allowedTargets:b.allowedTargets||[],status:'active',issuedAt,expiresAt:b.expiresAt||new Date(Date.now()+86400000).toISOString()};
-    if(!getScoped('agents',permit.agentId)) return json(res,400,{error:'unknown_agent'});
-    await store.add('permits',permit); const tx=await rialo.record('permit_issued',permit);
-    return json(res,201,{permit,tx});
-  }
-
-  const bulkRevoke=p.match(/^\/api\/agents\/([^/]+)\/revoke-permits$/);
-  if(bulkRevoke && req.method==='POST'){
-    if(!requireAuth(req,res))return;
-    const agent=getScoped('agents',bulkRevoke[1]); if(!agent)return json(res,404,{error:'not_found'});
-    const revokedAt=nowIso();
-    const revoked=await store.updateMany('permits',x=>x.workspaceId===wsId&&x.agentId===bulkRevoke[1]&&x.status==='active',{status:'revoked',revokedAt});
-    const tx=await rialo.record('permits_bulk_revoked',{agentId:bulkRevoke[1],count:revoked.length,revokedAt});
-    return json(res,200,{revoked:revoked.length,tx});
-  }
-
-  const clonePermit=p.match(/^\/api\/permits\/([^/]+)\/clone$/);
-  if(clonePermit && req.method==='POST'){
-    if(!requireAuth(req,res))return;
-    const source=getScoped('permits',clonePermit[1]); if(!source)return json(res,404,{error:'not_found'});
-    const b=await body(req);
-    const {revokedAt:_r,...rest}=source;
-    const clone={...rest,id:id('permit'),issuedAt:nowIso(),expiresAt:b.expiresAt||new Date(Date.now()+86400000).toISOString(),status:'active'};
-    await store.add('permits',clone);
-    const tx=await rialo.record('permit_issued',clone);
-    return json(res,201,{permit:clone,tx});
-  }
-
-  const revoke=p.match(/^\/api\/permits\/([^/]+)\/revoke$/);
-  if(revoke && req.method==='POST'){
-    if(!requireAuth(req,res))return;
-    const existing=getScoped('permits',revoke[1]); if(!existing)return json(res,404,{error:'not_found'});
-    const permit=await store.update('permits',revoke[1],{status:'revoked',revokedAt:nowIso()});
-    if(!permit)return json(res,404,{error:'not_found'}); const tx=await rialo.record('permit_revoked',permit); return json(res,200,{permit,tx});
-  }
-
-  if(p==='/api/actions/authorize' && req.method==='POST'){
-    if(!requireAuth(req,res))return;
-    const request=await body(req); const permit=getScoped('permits',request.permitId);
-    let evaluation;
-    const scan=scanForPromptInjection({input:request.input,payload:request.payload,context:request.context});
-    if(scan.score>0) await store.add('securityEvents',{id:id('sec'),workspaceId:wsId,agentId:request.agentId,permitId:request.permitId,scan,createdAt:nowIso()});
-    if(workspace()?.emergencyStopped) evaluation={decision:'blocked',code:'emergency_stop',reason:'Workspace emergency stop is active'};
-    else if(!scan.safe) evaluation={decision:scan.recommendation==='block'?'blocked':'escalated',code:'prompt_injection_risk',reason:`Prompt firewall detected ${scan.matches.map(x=>x.label).join(', ')}`};
-    else evaluation=evaluatePermit({permit,request,receipts:scoped('receipts')});
-    let execution=null;
-    if(evaluation.decision==='authorized') { try{ execution=await executeProtected(request,wsId); } catch(error){ evaluation={decision:'blocked',code:'execution_failed',reason:error.message}; } }
-    const {receipt,tx}=await createDecisionReceipt(request,permit,evaluation,execution,wsId);
-    // Auto-update agent risk score based on decision history
-    if(request.agentId){
-      const agentReceipts=store.list('receipts').filter(r=>r.agentId===request.agentId&&r.workspaceId===wsId);
-      if(agentReceipts.length>=3){
-        const bad=agentReceipts.filter(r=>r.result!=='authorized').length;
-        await store.update('agents',request.agentId,{risk:Math.min(100,Math.round((bad/agentReceipts.length)*100))});
-      }
+    if(b.relayToken!==relayToken) return json(res,403,{error:'invalid_relay_token'});
+    const {payload,signature}=b;
+    if(!payload||!signature) return json(res,400,{error:'payload_and_signature_required'});
+    try {
+      // Verify the payload hasn't expired
+      if(payload.expiresAt && Math.floor(Date.now()/1000)>payload.expiresAt) return json(res,400,{error:'meta_tx_expired'});
+      // Record on Rialo (mock or RPC)
+      const result=await rialo.record(payload.kind,{...payload.params,signer:payload.signer,nonce:payload.nonce,gasAmount:payload.gasAmount});
+      // Log the relay event
+      store.append('audit',{action:'cruise.relay',kind:payload.kind,signer:payload.signer,nonce:payload.nonce,txHash:result.txHash,gasAmount:payload.gasAmount,timestamp:Date.now()});
+      return json(res,200,{success:true,txHash:result.txHash,block:result.block,status:result.status});
+    } catch(error){
+      return json(res,400,{error:`relay_failed: ${error.message}`});
     }
-    let approval=null;
-    if(evaluation.decision==='escalated') approval=await store.add('approvals',{id:id('approval'),workspaceId:wsId,receiptId:receipt.id,permitId:request.permitId,agentId:request.agentId,action:{scope:request.scope,target:request.target||null,amount:Number(request.amount||0)},status:'pending',reason:evaluation.reason,createdAt:nowIso()});
-    return json(res,200,{evaluation,scan,receipt,approval,tx});
   }
 
-  const approvalAction=p.match(/^\/api\/approvals\/([^/]+)\/(approve|deny)$/);
-  if(approvalAction && req.method==='POST'){
-    if(!requireAuth(req,res))return;
-    const [_,approvalId,action]=approvalAction; const approval=getScoped('approvals',approvalId);
-    if(!approval)return json(res,404,{error:'not_found'}); if(approval.status!=='pending')return json(res,409,{error:'already_decided'});
-    const b=await body(req); await store.update('approvals',approvalId,{status:action==='approve'?'approved':'denied',reviewer:b.reviewer||'workspace-admin',note:b.note||'',decidedAt:nowIso()});
-    const tx=await rialo.record(`approval_${action}`,store.get('approvals',approvalId));
-    return json(res,200,{approval:store.get('approvals',approvalId),tx});
+  // ---- Rialo Cruise: Get Nonce ----
+  if(p.startsWith('/api/cruise/nonce/')&&req.method==='GET'){
+    const signer=p.slice('/api/cruise/nonce/'.length);
+    try {
+      const nonce=await rialo.getNonce(signer);
+      return json(res,200,{signer,nonce});
+    } catch(error){
+      return json(res,400,{error:`nonce_failed: ${error.message}`});
+    }
   }
 
-  if(p==='/api/security/scan' && req.method==='POST'){
-    if(!requireAuth(req,res))return;
-    const input=await body(req); const scan=scanForPromptInjection(input);
-    if(scan.score>0) await store.add('securityEvents',{id:id('sec'),workspaceId:wsId,scan,source:'manual_scan',createdAt:nowIso()});
-    return json(res,200,scan);
+  // ---- Rialo Cruise: Sponsored Permit (direct, no meta-tx) ----
+  if(p==='/api/cruise/sponsored-permit'&&req.method==='POST'){
+    if(!requireAuth(req,res)) return;
+    const b=await body(req);
+    try {
+      const result=await rialo.record('sponsored_issue_permit',{
+        permitId:b.permitId||id(),
+        agentId:b.agentId,
+        policyId:b.policyId,
+        scopeRoot:b.scopeRoot,
+        budgetCap:b.budgetCap,
+        maxPerAction:b.maxPerAction,
+        expiresAt:b.expiresAt,
+        signer:b.signer,
+        nonce:b.nonce||0,
+        gasAmount:b.gasAmount||1000
+      });
+      return json(res,200,{success:true,txHash:result.txHash,permitId:b.permitId});
+    } catch(error){
+      return json(res,400,{error:`sponsored_permit_failed: ${error.message}`});
+    }
   }
 
-  if(p==='/api/credentials' && req.method==='POST'){
-    if(!requireAuth(req,res))return;
-    const b=await body(req); if(!b.name||!b.value)return json(res,400,{error:'name_and_value_required'});
-    const item={id:id('cred'),workspaceId:wsId,name:b.name,provider:b.provider||'custom',status:'active',lastUsedAt:null,createdAt:nowIso(),encrypted:encryptCredential(b.value,vaultSecret)};
-    await store.add('credentials',item); await rialo.record('credential_registered',{id:item.id,name:item.name,provider:item.provider,createdAt:item.createdAt});
-    return json(res,201,{credential:redactCredential(item)});
+  // ---- Rialo Cruise: Status ----
+  if(p==='/api/cruise/status'&&req.method==='GET'){
+    const health=await rialo.health();
+    return json(res,200,{
+      cruiseEnabled:health.cruiseEnabled,
+      mode:health.mode,
+      chainId:health.chainId,
+      connected:health.connected,
+      relayerConfigured:!!process.env.RIALO_RELAYER_KEY
+    });
   }
 
-  const credentialDelete=p.match(/^\/api\/credentials\/([^/]+)$/);
-  if(credentialDelete && req.method==='DELETE'){
-    if(!requireAuth(req,res))return;
-    const existing=getScoped('credentials',credentialDelete[1]); if(!existing)return json(res,404,{error:'not_found'});
-    const item=await store.update('credentials',credentialDelete[1],{status:'revoked',revokedAt:nowIso()});
-    if(!item)return json(res,404,{error:'not_found'}); await rialo.record('credential_revoked',{id:item.id}); return json(res,200,{credential:redactCredential(item)});
+  // ---- Health ----
+  if(p==='/api/health'&&req.method==='GET'){
+    const rialoHealth=await rialo.health();
+    return json(res,200,{ok:true,rialo:rialoHealth});
   }
 
-  if(p==='/api/emergency-stop' && req.method==='POST'){
-    if(!requireAuth(req,res))return;
-    const b=await body(req); const agentId=b.agentId||null;
-    const incident={id:id('incident'),workspaceId:wsId,type:'emergency_stop',scope:agentId?'agent':'workspace',agentId,reason:b.reason||'Manual emergency stop',status:'active',createdAt:nowIso()};
-    if(agentId){ await store.update('agents',agentId,{status:'paused'}); await store.updateMany('permits',x=>x.workspaceId===wsId&&x.agentId===agentId&&x.status==='active',{status:'revoked',revokedAt:nowIso()}); }
-    else { await store.update('workspaces',wsId,{emergencyStopped:true,emergencyStoppedAt:nowIso()}); await store.updateMany('agents',x=>x.workspaceId===wsId&&x.status==='active',{status:'paused'}); await store.updateMany('permits',x=>x.workspaceId===wsId&&x.status==='active',{status:'revoked',revokedAt:nowIso()}); }
-    await store.add('incidents',incident); const tx=await rialo.record('emergency_stop',incident); return json(res,200,{incident,tx});
+  // ---- Policies ----
+  if(p==='/api/policies'&&req.method==='POST'){
+    if(!requireAuth(req,res)) return;
+    const b=await body(req);
+    const policyId=b.policyId||id();
+    const policy={id:policyId,name:b.name,scopes:b.scopes,roleId:b.roleId,budgetCap:b.budgetCap||0,maxPerAction:b.maxPerAction||0,minApprovals:b.minApprovals||0,requiresTimelock:b.requiresTimelock||false,rateLimitPerMinute:b.rateLimitPerMinute||0,conditions:b.conditions||[],workspaceId:ctx.workspaceId,createdAt:nowIso()};
+    store.put('policies',policy);
+    await rialo.record('publishPolicy',{policyId,policyHash:sha256(JSON.stringify(policy)),version:1,roleId:b.roleId,minApprovals:b.minApprovals||0,requiresTimelock:b.requiresTimelock||false});
+    return json(res,201,{policy});
   }
 
-  if(p==='/api/emergency-resume' && req.method==='POST'){
-    if(!requireAuth(req,res))return;
-    const b=await body(req); await store.update('workspaces',wsId,{emergencyStopped:false,resumedAt:nowIso()}); await store.updateMany('agents',x=>x.workspaceId===wsId&&x.status==='paused',{status:'active'});
-    const incident={id:id('incident'),workspaceId:wsId,type:'emergency_resume',scope:'workspace',reason:b.reason||'Manual resume',status:'resolved',createdAt:nowIso()};
-    await store.add('incidents',incident); const tx=await rialo.record('emergency_resume',incident); return json(res,200,{incident,warning:'Previously revoked permits remain revoked and must be reissued',tx});
+  if(p==='/api/policies'&&req.method==='GET'){
+    const all=store.list('policies').filter(x=>x.workspaceId===ctx.workspaceId);
+    return json(res,200,{policies:all});
   }
 
-  // Stripe webhook
-  if(p==='/api/webhooks/stripe' && req.method==='POST'){
-    const raw=await rawBody(req);
-    try{
-      const billing=new StripeBillingAdapter();
-      const event=billing.verifyEvent(raw.toString(),req.headers['stripe-signature']||'');
-      if(event.type==='checkout.session.completed'){
-        const wsTarget=event.data?.object?.metadata?.workspace_id;
-        const plan=event.data?.object?.metadata?.plan;
-        if(wsTarget&&plan) await store.update('workspaces',wsTarget,{plan});
-      }
-      return json(res,200,{received:true,type:event.type});
-    }catch(e){return json(res,400,{error:e.message});}
+  // ---- Roles ----
+  if(p==='/api/roles'&&req.method==='POST'){
+    if(!requireAuth(req,res)) return;
+    const b=await body(req);
+    const roleId=b.roleId||id();
+    const role={id:roleId,name:b.name,scopes:b.scopes,maxBudget:b.maxBudget||0,maxPerAction:b.maxPerAction||0,canDelegate:b.canDelegate||false,canApprove:b.canApprove||false,workspaceId:ctx.workspaceId,createdAt:nowIso()};
+    store.put('roles',role);
+    return json(res,201,{role});
   }
 
-  const verify=p.match(/^\/api\/receipts\/([^/]+)\/verify$/);
-  if(verify && req.method==='GET'){ const r=getScoped('receipts',verify[1]); if(!r)return json(res,404,{error:'not_found'}); return json(res,200,{valid:verifyReceipt(r,secret),receipt:r}); }
+  // ---- Agents ----
+  if(p==='/api/agents'&&req.method==='POST'){
+    if(!requireAuth(req,res)) return;
+    const b=await body(req);
+    const agent={id:b.agentId||id(),controller:b.controller,roleId:b.roleId,active:true,workspaceId:ctx.workspaceId,createdAt:nowIso()};
+    store.put('agents',agent);
+    await rialo.record('registerAgent',{agentId:agent.id,controller:b.controller,roleId:b.roleId});
+    return json(res,201,{agent});
+  }
 
+  // ---- Permits ----
+  if(p==='/api/permits'&&req.method==='POST'){
+    if(!requireAuth(req,res)) return;
+    const b=await body(req);
+    const expiresAt=Math.floor(Date.now()/1000)+(b.expiresIn||3600);
+    const permitId=b.permitId||id();
+    const permit={id:permitId,agentId:b.agentId,policyId:b.policyId,scope:b.scope,budgetCap:b.budgetCap||0,maxPerAction:b.maxPerAction||0,expiresAt,status:'active',workspaceId:ctx.workspaceId,createdAt:nowIso()};
+    store.put('permits',permit);
+    await rialo.record('issuePermit',{permitId,agentId:b.agentId,policyId:b.policyId,scopeRoot:sha256(b.scope||''),budgetCap:b.budgetCap||0,maxPerAction:b.maxPerAction||0,expiresAt});
+    return json(res,201,{permit});
+  }
+
+  if(p.startsWith('/api/permits/')&&p.endsWith('/freeze')&&req.method==='POST'){
+    if(!requireAuth(req,res)) return;
+    const permitId=p.split('/')[3];
+    const item=store.get('permits',permitId);
+    if(!item||item.workspaceId!==ctx.workspaceId) return json(res,404,{error:'not_found'});
+    item.status='frozen';
+    store.put('permits',item);
+    await rialo.record('freezePermit',{permitId});
+    return json(res,200,{permit:item});
+  }
+
+  if(p.startsWith('/api/permits/')&&p.endsWith('/unfreeze')&&req.method==='POST'){
+    if(!requireAuth(req,res)) return;
+    const permitId=p.split('/')[3];
+    const item=store.get('permits',permitId);
+    if(!item||item.workspaceId!==ctx.workspaceId) return json(res,404,{error:'not_found'});
+    item.status='active';
+    store.put('permits',item);
+    await rialo.record('unfreezePermit',{permitId});
+    return json(res,200,{permit:item});
+  }
+
+  // ---- Delegations ----
+  if(p==='/api/delegations'&&req.method==='POST'){
+    if(!requireAuth(req,res)) return;
+    const b=await body(req);
+    const expiresAt=Math.floor(Date.now()/1000)+(b.expiresIn||3600);
+    const delegation={id:b.delegationId||id(),agentId:b.agentId,delegate:b.delegate,scope:b.scope,expiresAt,active:true,workspaceId:ctx.workspaceId,createdAt:nowIso()};
+    store.put('delegations',delegation);
+    await rialo.record('createDelegation',{delegationId:delegation.id,agentId:b.agentId,delegate:b.delegate,scopeRoot:sha256(b.scope||''),expiresAt});
+    return json(res,201,{delegation});
+  }
+
+  // ---- Stakes ----
+  if(p==='/api/stakes/deposit'&&req.method==='POST'){
+    if(!requireAuth(req,res)) return;
+    const b=await body(req);
+    const stake={id:b.agentId||id(),agentId:b.agentId,amount:b.amount,status:'active',workspaceId:ctx.workspaceId,createdAt:nowIso()};
+    store.put('stakes',stake);
+    await rialo.record('depositStake',{agentId:b.agentId,amount:b.amount});
+    return json(res,201,{stake});
+  }
+
+  // ---- Credentials ----
+  if(p==='/api/credentials'&&req.method==='POST'){
+    if(!requireAuth(req,res)) return;
+    const b=await body(req);
+    const id_=b.credentialId||id();
+    const encrypted=encryptCredential(b.value,vaultSecret);
+    const credential={id:id_,name:b.name,provider:b.provider,configured:true,encrypted,workspaceId:ctx.workspaceId,createdAt:nowIso()};
+    store.put('credentials',credential);
+    await rialo.record('registerCredentialHash',{credentialId:id_,metadataHash:sha256(JSON.stringify({name:b.name,provider:b.provider}))});
+    return json(res,201,{credential:{id:id_,name:b.name,provider:b.provider,configured:true}});
+  }
+
+  // ---- Approvals ----
+  if(p.startsWith('/api/approvals/')&&p.endsWith('/vote')&&req.method==='POST'){
+    if(!requireAuth(req,res)) return;
+    const approvalId=p.split('/')[3];
+    const b=await body(req);
+    const item=store.get('approvals',approvalId);
+    if(!item) return json(res,404,{error:'not_found'});
+    item.votes=item.votes||[];
+    item.votes.push({guardian:b.guardian,approved:b.approved,at:nowIso()});
+    const yesVotes=item.votes.filter(v=>v.approved).length;
+    if(yesVotes>=(item.requiredVotes||1)) item.status='approved';
+    else if(item.votes.filter(v=>!v.approved).length>=(item.requiredVotes||1)) item.status='denied';
+    store.put('approvals',item);
+    await rialo.record('castVote',{approvalId,guardian:b.guardian,approved:b.approved});
+    return json(res,200,{approval:item});
+  }
+
+  // ---- Action Authorization ----
+  if(p==='/api/actions/authorize'&&req.method==='POST'){
+    const b=await body(req);
+    const permitItem=store.get('permits',b.permitId);
+    if(!permitItem) return json(res,404,{error:'permit_not_found'});
+    const wsId=permitItem.workspaceId;
+    const agentItem=store.get('agents',permitItem.agentId||b.agentId);
+    const policyItem=store.get('policies',permitItem.policyId);
+    const scan=scanForPromptInjection(b.input||'',firewallRules);
+    if(scan.score>=70){
+      const receipt=createReceipt({permitId:b.permitId,actionHash:sha256(b.input||''),amount:0,result:'blocked_firewall',secret});
+      store.put('receipts',receipt);
+      await rialo.record('recordDenial',{permitId:b.permitId,actionHash:sha256(b.input||''),receiptId:receipt.id,previousHash:'',result:4});
+      return json(res,200,{evaluation:{decision:'blocked',reason:'Prompt injection detected'},scan,receipt});
+    }
+    const evaluation=evaluatePermit({permit:permitItem,agent:agentItem,policy:policyItem,request:b});
+    if(evaluation.decision==='authorized'){
+      const amount=b.amount||0;
+      permitItem.spent=(permitItem.spent||0)+amount;
+      store.put('permits',permitItem);
+      const receipt=createReceipt({permitId:b.permitId,actionHash:sha256(JSON.stringify(b)),amount,result:'authorized',secret});
+      store.put('receipts',receipt);
+      const execResult=b.execute?await executeProtected(b,wsId):null;
+      await rialo.record('authorizeAndConsume',{permitId:b.permitId,actionHash:sha256(JSON.stringify(b)),amount,receiptId:receipt.id,previousHash:''});
+      return json(res,200,{evaluation,receipt,scan,execution:execResult});
+    }
+    if(evaluation.decision==='escalated'){
+      const approvalId=b.approvalId||id();
+      const approval={id:approvalId,permitId:b.permitId,actionHash:sha256(JSON.stringify(b)),amount:b.amount||0,status:'pending',requiredVotes:policyItem?.minApprovals||1,votes:[],workspaceId:wsId,createdAt:nowIso()};
+      store.put('approvals',approval);
+      await rialo.record('requestApproval',{approvalId,permitId:b.permitId,actionHash:sha256(JSON.stringify(b)),amount:b.amount||0,requiredVotes:policyItem?.minApprovals||1});
+      return json(res,200,{evaluation,approval,scan});
+    }
+    const receipt=createReceipt({permitId:b.permitId,actionHash:sha256(JSON.stringify(b)),amount:0,result:evaluation.decision,secret});
+    store.put('receipts',receipt);
+    await rialo.record('recordDenial',{permitId:b.permitId,actionHash:sha256(JSON.stringify(b)),receiptId:receipt.id,previousHash:'',result:evaluation.decision==='denied_budget'?2:evaluation.decision==='denied_scope'?3:4});
+    return json(res,200,{evaluation,receipt,scan});
+  }
+
+  // ---- Receipts ----
+  if(p.startsWith('/api/receipts/')&&p.endsWith('/verify')&&req.method==='GET'){
+    const id=p.split('/')[3];
+    const r=store.get('receipts',id);
+    if(!r)return json(res,404,{error:'not_found'});
+    return json(res,200,{valid:verifyReceipt(r,secret),receipt:r});
+  }
+
+  // ---- SaaS Platform Routes ----
+  if(p.startsWith('/api/v1/')) {
+    const handled=await platform.handle({req,res,path:p,json,readBody:body});
+    if(handled) return;
+  }
+
+  // ---- Static Files ----
   if(p.startsWith('/api/')) return json(res,404,{error:'not_found'});
   const file=p==='/'?'landing.html':p==='/app'?'index.html':p==='/signup'?'signup.html':p==='/account'?'account.html':p.slice(1);
   const safe=path.normalize(file).replace(/^\.\.(\/|\\|$)/,'');
