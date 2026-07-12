@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "https://permitly.fastapicloud.dev/api/$1" }
+  ]
+}
