@@ -13,6 +13,16 @@ from datetime import datetime, timedelta, timezone
 router = APIRouter(tags=["permits"])
 
 
+@router.get("/api/permits")
+async def list_permits(
+    ctx: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    ws_id = uuid.UUID(ctx.workspace_id)
+    items = await crud.list_workspace_items(db, Permit, ws_id)
+    return {"items": [{"id": str(p.id), "agentId": str(p.agent_id), "policyId": str(p.policy_id) if p.policy_id else None, "scopes": p.scopes, "budgetCap": p.budget_cap, "maxPerAction": p.max_per_action, "rateLimitPerMinute": p.rate_limit_per_minute, "status": p.status, "expiresAt": p.expires_at.isoformat()} for p in items]}
+
+
 @router.post("/api/permits")
 async def create_permit(
     body: dict,

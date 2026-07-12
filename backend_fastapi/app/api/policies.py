@@ -51,4 +51,4 @@ async def list_policies(
 ):
     ws_id = uuid.UUID(ctx.workspace_id)
     policies = await crud.list_workspace_items(db, Policy, ws_id)
-    return {"policies": [{"id": str(p.id), "name": p.name, "scopes": p.scopes, "status": p.status, "version": p.version, "createdAt": p.created_at.isoformat()} for p in policies]}
+    return {"items": [{"id": str(p.id), "name": p.name, "scopes": p.scopes, "budgetCap": p.budget_cap, "maxPerAction": p.max_per_action, "rateLimitPerMinute": p.rate_limit_per_minute, "conditions": p.conditions, "status": p.status, "version": p.version, "createdAt": p.created_at.isoformat()} for p in policies]}

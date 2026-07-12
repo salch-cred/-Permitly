@@ -11,6 +11,16 @@ import uuid
 router = APIRouter(tags=["approvals"])
 
 
+@router.get("/api/approvals")
+async def list_approvals(
+    ctx: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    ws_id = uuid.UUID(ctx.workspace_id)
+    items = await crud.list_workspace_items(db, Approval, ws_id)
+    return {"items": [{"id": str(a.id), "agentId": str(a.agent_id), "action": {"scope": a.action.get("scope", ""), "target": a.action.get("target", ""), "amount": a.action.get("amount", 0)} if isinstance(a.action, dict) else {"scope": str(a.action)}, "reason": a.reason, "status": a.status, "createdAt": a.created_at.isoformat()} for a in items]}
+
+
 @router.post("/api/approvals/{approval_id}/vote")
 async def cast_vote(
     approval_id: str,

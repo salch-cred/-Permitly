@@ -11,6 +11,16 @@ import uuid
 router = APIRouter(tags=["agents"])
 
 
+@router.get("/api/agents")
+async def list_agents(
+    ctx: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    ws_id = uuid.UUID(ctx.workspace_id)
+    items = await crud.list_workspace_items(db, Agent, ws_id)
+    return {"items": [{"id": str(a.id), "name": a.name, "type": a.type, "status": a.status, "risk": a.risk, "createdAt": a.created_at.isoformat()} for a in items]}
+
+
 @router.post("/api/agents")
 async def create_agent(
     body: dict,

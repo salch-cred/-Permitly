@@ -14,6 +14,16 @@ import uuid
 router = APIRouter(tags=["credentials"])
 
 
+@router.get("/api/credentials")
+async def list_credentials(
+    ctx: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    ws_id = uuid.UUID(ctx.workspace_id)
+    items = await crud.list_workspace_items(db, Credential, ws_id)
+    return {"items": [{"id": str(c.id), "name": c.name, "provider": c.provider, "status": c.status, "configured": bool(c.encrypted), "createdAt": c.created_at.isoformat()} for c in items]}
+
+
 @router.post("/api/credentials")
 async def create_credential(
     body: dict,

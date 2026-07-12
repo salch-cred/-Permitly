@@ -1,5 +1,9 @@
 {
+  "cleanUrls": true,
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "https://permitly.fastapicloud.dev/api/$1" }
+    { "source": "/api/(.*)", "destination": "https://permitly.fastapicloud.dev/api/$1" },
+    { "source": "/app", "destination": "/index.html" },
+    { "source": "/app/:path*", "destination": "/index.html" },
+    { "source": "/", "destination": "/landing.html" }
   ]
 }
