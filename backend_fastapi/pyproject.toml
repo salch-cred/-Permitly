@@ -2,7 +2,7 @@
 name = "permitly-backend"
 version = "4.2.0"
 description = "AgentPermit / Permitly FastAPI backend"
-requires-python = ">=3.12"
+requires-python = "==3.12.*"
 dependencies = [
     "fastapi[standard]==0.115.0",
     "pydantic==2.8.2",
