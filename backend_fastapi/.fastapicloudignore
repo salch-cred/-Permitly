@@ -1,0 +1,13 @@
+# Exclude local/dev artifacts from FastAPI Cloud uploads
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+data/
+*.db
+*.sqlite
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
